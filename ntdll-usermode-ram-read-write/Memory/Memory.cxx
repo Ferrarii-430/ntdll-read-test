@@ -17,10 +17,14 @@ namespace Memory {
         HANDLE, PVOID, PVOID, SIZE_T, PSIZE_T
     ) = nullptr;
 
+    NTSTATUS(NTAPI* __NtdllApi::NtQueryVirtualMemory)(
+        HANDLE, PVOID, ULONG, PVOID, SIZE_T, PSIZE_T
+    ) = nullptr;
+
 	Memory::Memory() 
         : _pid(0), _handle(nullptr) {
 
-        HMODULE ntdll = GetModuleHandle(L"ntdll.dll");
+        HMODULE ntdll = GetModuleHandleW(L"ntdll.dll");
         if (!ntdll) throw std::runtime_error(
             "::Memory failed to load 'ntdll.dll'."
         );
@@ -40,6 +44,12 @@ namespace Memory {
             GetProcAddress(ntdll, "NtWriteVirtualMemory")
         ); if (!__NtdllApi::NtWriteVirtualMemory) throw std::runtime_error(
             "::Memory failed to load 'NtWriteVirtualMemory'."
+        );
+
+        __NtdllApi::NtQueryVirtualMemory = reinterpret_cast<decltype(__NtdllApi::NtQueryVirtualMemory)>(
+            GetProcAddress(ntdll, "NtQueryVirtualMemory")
+        ); if (!__NtdllApi::NtQueryVirtualMemory) throw std::runtime_error(
+            "::Memory failed to load 'NtQueryVirtualMemory'."
         );
     };
 
@@ -125,10 +135,101 @@ namespace Memory {
         clientId.UniqueProcess = reinterpret_cast<HANDLE>(static_cast<DWORD_PTR>(_pid));
         clientId.UniqueThread = nullptr;
 
+        //PROCESS_VM_WRITE 移除写权限
         __NtdllApi::NtOpenProcess(
-            &_handle, PROCESS_VM_READ | PROCESS_VM_WRITE | PROCESS_QUERY_INFORMATION, &objectAttributes, &clientId
+            &_handle, PROCESS_VM_READ | PROCESS_QUERY_INFORMATION, &objectAttributes, &clientId
         ); if (!_handle) throw std::runtime_error(
             "::Memory failed to ::_handle with '" + std::string(name.begin(), name.end()) + "'."
         );
+    }
+
+    bool Memory::ReadRaw(
+        const std::uintptr_t address, void* buffer, const std::size_t size
+    ) const {
+        if (!_handle) throw std::runtime_error(
+            "::Memory read no access, ::_handle missing."
+        );
+
+        if (!address || !buffer || !size) return false;
+
+        SIZE_T readed = 0;
+        const NTSTATUS status = __NtdllApi::NtReadVirtualMemory(
+            _handle, reinterpret_cast<PVOID>(address), buffer, size, &readed
+        );
+
+        return status >= 0 && readed == size;
+    }
+
+    std::vector<std::uint8_t> Memory::ReadBytes(
+        const std::uintptr_t address, const std::size_t size
+    ) const {
+        std::vector<std::uint8_t> buffer(size);
+
+        if (!ReadRaw(address, buffer.data(), size)) buffer.clear();
+        return buffer;
+    }
+
+    std::wstring Memory::ReadWideString(
+        const std::uintptr_t address, const std::size_t maxLength
+    ) const {
+        const auto bytes = ReadBytes(address, maxLength * sizeof(wchar_t));
+        if (bytes.empty()) return { };
+
+        const auto* characters = reinterpret_cast<const wchar_t*>(bytes.data());
+
+        std::wstring result { };
+        for (std::size_t index = 0; index < maxLength && characters[index]; ++index)
+            result.push_back(characters[index]);
+
+        return result;
+    }
+
+    std::vector<MEMORY_BASIC_INFORMATION> Memory::GetRegions() const {
+        if (!_handle) throw std::runtime_error(
+            "::Memory query no access, ::_handle missing."
+        );
+
+        constexpr DWORD kReadable =
+            PAGE_READONLY | PAGE_READWRITE | PAGE_WRITECOPY |
+            PAGE_EXECUTE_READ | PAGE_EXECUTE_READWRITE | PAGE_EXECUTE_WRITECOPY;
+        constexpr DWORD kBlocked = PAGE_GUARD | PAGE_NOACCESS;
+
+        std::vector<MEMORY_BASIC_INFORMATION> regions { };
+
+        std::uintptr_t address = 0;
+        MEMORY_BASIC_INFORMATION information { };
+
+        while (__NtdllApi::NtQueryVirtualMemory(
+            _handle, reinterpret_cast<PVOID>(address), 0,
+            &information, sizeof(information), nullptr
+        ) >= 0) {
+            if (!information.RegionSize) break;
+
+            if (information.State == MEM_COMMIT
+                && (information.Protect & kReadable)
+                && !(information.Protect & kBlocked)) regions.push_back(information);
+
+            const std::uintptr_t next = address + information.RegionSize;
+            if (next <= address) break;
+
+            address = next;
+        }
+
+        return regions;
+    }
+
+    std::uintptr_t Memory::ReadChain(
+        std::uintptr_t base, const std::vector<std::uintptr_t>& offsets
+    ) const {
+        if (!base || offsets.empty()) return 0;
+
+        for (std::size_t index = 0; index < offsets.size(); ++index) {
+            base += offsets[index];
+            if (index + 1 == offsets.size()) break;
+
+            if (!ReadRaw(base, &base, sizeof(base)) || !base) return 0;
+        }
+
+        return base;
     }
 }
