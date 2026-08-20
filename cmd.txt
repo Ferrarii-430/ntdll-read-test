@@ -1,0 +1,9 @@
+cd D:\CppProduct\ntdll-usermode-ram-read-write\Build
+
+.\ntdll-usermode-ram-read-write.exe --watch 0x13725a67060:0x200:8 0x1376aaec480 0x1376aaec3a8 0x1376aaec0e0 0x137197f8ca8 0x1372f1a8590 0x1372c848bcc 0x137342770d8 --interval=500
+
+.\ntdll-usermode-ram-read-write.exe --watch 0x137425c84c0  0x13720bfc2bc 0x13720bfc2c0 0x1154ce4724 --interval=500
+
+.\ntdll-usermode-ram-read-write.exe --autowatch
+
+.\ntdll-usermode-ram-read-write.exe  --diffscan

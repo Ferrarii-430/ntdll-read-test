@@ -6,6 +6,8 @@
 #include <cstring>
 #include <fstream>
 #include <sstream>
+#include <string>
+#include <vector>
 #include <unordered_map>
 
 #include "Memory/Memory.hxx"
@@ -118,6 +120,156 @@ static bool DiffScanSeries(
 	return std::abs(delta) >= minDelta && std::abs(delta) <= maxDelta;
 }
 
+static bool DiffScanFloatBitsPlausible(const std::uint32_t bits) {
+	float value { };
+	std::memcpy(&value, &bits, sizeof(value));
+
+	return std::isfinite(value)
+		&& std::abs(value) >= 1e-3f && std::abs(value) <= 1e7f;
+}
+
+// 三快照: A/B 全量, 取值有变化的块, 再补读 C; 供 diffscan 与 autowatch 复用
+struct DiffScanTriple {
+	DiffScanSnapshot a;
+	DiffScanSnapshot b;
+	DiffScanSnapshot c;
+	double dt1 = 0.0;
+	double dt2 = 0.0;
+};
+
+static DiffScanTriple TakeTripleSnapshots(
+	const Memory::PMemory memory,
+	const std::vector<MEMORY_BASIC_INFORMATION>& regions,
+	const DWORD gapMs
+) {
+	DiffScanTriple triple { };
+
+	std::cout << "snapshot A ..." << std::endl;
+	const auto timeA = std::chrono::steady_clock::now();
+	auto snapshotA = TakeSnapshot(memory, regions);
+
+	Sleep(gapMs);
+
+	std::cout << "snapshot B ..." << std::endl;
+	const auto timeB = std::chrono::steady_clock::now();
+	auto snapshotB = TakeSnapshot(memory, regions);
+
+	std::unordered_map<std::uintptr_t, std::size_t> snapshotBIndex { };
+	for (std::size_t index = 0; index < snapshotB.blocks.size(); ++index)
+		snapshotBIndex[snapshotB.blocks[index].base] = index;
+
+	for (auto& block : snapshotA.blocks) {
+		const auto found = snapshotBIndex.find(block.base);
+		if (found == snapshotBIndex.end()) continue;
+
+		auto& other = snapshotB.blocks[found->second];
+		if (other.data.size() != block.data.size()) continue;
+		if (std::memcmp(block.data.data(), other.data.data(), block.data.size()) != 0) {
+			triple.a.bytes += block.data.size();
+			triple.a.blocks.push_back(std::move(block));
+
+			triple.b.bytes += other.data.size();
+			triple.b.blocks.push_back(std::move(other));
+		}
+	}
+
+	Sleep(gapMs);
+
+	std::cout << "snapshot C ..." << std::endl;
+	const auto timeC = std::chrono::steady_clock::now();
+
+	for (const auto& block : triple.b.blocks) {
+		DiffScanSnapshot::Block fresh { block.base, std::vector<std::uint8_t>(block.data.size()) };
+		if (memory->ReadRaw(fresh.base, fresh.data.data(), fresh.data.size()))
+			triple.c.bytes += fresh.data.size();
+		else fresh.data.clear();
+
+		triple.c.blocks.push_back(std::move(fresh));
+	}
+
+	triple.dt1 = std::chrono::duration<double>(timeB - timeA).count();
+	triple.dt2 = std::chrono::duration<double>(timeC - timeB).count();
+
+	return triple;
+}
+
+// 提取三快照中匀速变化的 float 候选
+static void CollectFloatCandidates(
+	const DiffScanTriple& triple,
+	std::vector<DiffScanCandidate>& candidates
+) {
+	const double dt = (triple.dt1 + triple.dt2) * 0.5;
+	if (dt <= 0.0) return;
+
+	for (std::size_t blockIndex = 0; blockIndex < triple.a.blocks.size(); ++blockIndex) {
+		const auto& blockA = triple.a.blocks[blockIndex];
+		const auto& blockB = triple.b.blocks[blockIndex];
+		const auto& blockC = triple.c.blocks[blockIndex];
+
+		if (blockB.data.size() != blockA.data.size()) continue;
+		if (blockC.data.size() != blockA.data.size()) continue;
+
+		for (std::size_t offset = 0; offset + 4 <= blockA.data.size(); offset += 4) {
+			float fa { }, fb { }, fc { };
+			std::memcpy(&fa, blockA.data.data() + offset, sizeof(fa));
+			std::memcpy(&fb, blockB.data.data() + offset, sizeof(fb));
+			std::memcpy(&fc, blockC.data.data() + offset, sizeof(fc));
+
+			double delta = 0.0;
+			if (DiffScanSeries(fa, fb, fc, 0.01, 1000000.0, delta))
+				candidates.push_back({ blockA.base + offset, fa, fb, fc, delta / dt });
+		}
+	}
+}
+
+// 同步值组: 同一份数据在内存中存在多份拷贝(逻辑/渲染等), 同时刻值完全相同
+struct AutoWatchGroup {
+	std::uintptr_t address; // 组内代表地址
+	std::size_t copies;     // 组内同步地址数
+	double v1;              // B 时刻值(聚类键)
+	double velocity;        // 平均速度
+};
+
+// 按 B 时刻值聚类: 值完全相同的匀速候选归为一组, 即同一份数据的多份拷贝
+static std::vector<AutoWatchGroup> ClusterByValue(std::vector<DiffScanCandidate> candidates) {
+	std::sort(candidates.begin(), candidates.end(),
+		[](const DiffScanCandidate& left, const DiffScanCandidate& right) {
+			return left.v1 < right.v1;
+		});
+
+	std::vector<AutoWatchGroup> groups { };
+
+	std::size_t begin = 0;
+	while (begin < candidates.size()) {
+		std::size_t end = begin + 1;
+		while (end < candidates.size()
+			&& std::abs(candidates[end].v1 - candidates[end - 1].v1) <= 0.25)
+			++end;
+
+		if (end - begin >= 2) {
+			double velocity = 0.0;
+			for (std::size_t index = begin; index < end; ++index)
+				velocity += candidates[index].velocity;
+			velocity /= static_cast<double>(end - begin);
+
+			// 速度与数值范围过滤: 排除 UI 动画/音频等噪声, 保留屏幕坐标量级
+			if (std::abs(velocity) >= 1.0 && std::abs(velocity) <= 500.0
+				&& std::abs(candidates[begin].v1) <= 10000.0)
+				groups.push_back({ candidates[begin].address, end - begin,
+					candidates[begin].v1, velocity });
+		}
+
+		begin = end;
+	}
+
+	std::sort(groups.begin(), groups.end(),
+		[](const AutoWatchGroup& left, const AutoWatchGroup& right) {
+			return left.copies > right.copies;
+		});
+
+	return groups;
+}
+
 static void DiffScanReport(
 	const char* const type,
 	std::vector<DiffScanCandidate> candidates,
@@ -147,23 +299,28 @@ static void DiffScanReport(
 		groups.push_back({ candidates[index].velocity, 1, index });
 	}
 
-	std::sort(groups.begin(), groups.end(),
-		[](const Group& left, const Group& right) { return left.count > right.count; });
+	std::size_t singles = 0;
+	std::vector<const Group*> largeGroups { }, smallGroups { };
+	for (const auto& group : groups) {
+		if (group.count == 1) ++singles;
+		else if (group.count <= 64) smallGroups.push_back(&group);
+		else largeGroups.push_back(&group);
+	}
 
 	stream << "\n[" << type << "] candidates = " << candidates.size()
-		<< ", groups = " << groups.size() << std::endl;
+		<< ", groups = " << groups.size()
+		<< ", singles = " << singles << std::endl;
 
-	std::size_t shown = 0;
-	for (const auto& group : groups) {
-		if (++shown > 12) {
-			stream << "  ... more groups omitted" << std::endl;
-			break;
-		}
+	std::sort(largeGroups.begin(), largeGroups.end(),
+		[](const Group* left, const Group* right) { return left->count > right->count; });
+	std::sort(smallGroups.begin(), smallGroups.end(),
+		[](const Group* left, const Group* right) { return left->count < right->count; });
 
+	const auto printGroup = [&](const Group& group, const std::size_t memberLimit) {
 		stream << "  v = " << std::setprecision(6) << group.velocity << " /s"
 			<< ", count = " << group.count << std::endl;
 
-		const auto limit = std::min<std::size_t>(group.count, 8);
+		const auto limit = std::min<std::size_t>(group.count, memberLimit);
 		for (std::size_t index = 0; index < limit; ++index) {
 			const auto& candidate = candidates[group.first + index];
 
@@ -175,6 +332,27 @@ static void DiffScanReport(
 			stream << "  " << std::setprecision(9)
 				<< candidate.v0 << " -> " << candidate.v1 << " -> " << candidate.v2 << std::endl;
 		}
+	};
+
+	if (!smallGroups.empty()) {
+		stream << "  -- small groups (2..64), suspects --" << std::endl;
+
+		std::size_t shown = 0;
+		for (const auto* group : smallGroups) {
+			if (++shown > 100) {
+				stream << "  ... more small groups omitted" << std::endl;
+				break;
+			}
+
+			printGroup(*group, 32);
+		}
+	}
+
+	if (!largeGroups.empty()) {
+		stream << "  -- large groups (count > 64), context --" << std::endl;
+
+		const auto limit = std::min<std::size_t>(largeGroups.size(), 8);
+		for (std::size_t index = 0; index < limit; ++index) printGroup(*largeGroups[index], 4);
 	}
 }
 
@@ -198,98 +376,44 @@ static int RunDiffScan(void) {
 			<< "\nwritable regions = " << regions.size()
 			<< ", total = " << (total / 1024 / 1024) << " MB" << std::endl;
 
-		std::cout << "snapshot A ..." << std::endl;
-		const auto timeA = std::chrono::steady_clock::now();
-		auto snapshotA = TakeSnapshot(memory, regions);
+		const auto triple = TakeTripleSnapshots(memory, regions, 600);
 
-		Sleep(600);
-
-		std::cout << "snapshot B ..." << std::endl;
-		const auto timeB = std::chrono::steady_clock::now();
-		auto snapshotB = TakeSnapshot(memory, regions);
-
-		std::unordered_map<std::uintptr_t, std::size_t> snapshotBIndex { };
-		for (std::size_t index = 0; index < snapshotB.blocks.size(); ++index)
-			snapshotBIndex[snapshotB.blocks[index].base] = index;
-
-		DiffScanSnapshot keptA { }, keptB { };
-		for (auto& block : snapshotA.blocks) {
-			const auto found = snapshotBIndex.find(block.base);
-			if (found == snapshotBIndex.end()) continue;
-
-			auto& other = snapshotB.blocks[found->second];
-			if (other.data.size() != block.data.size()) continue;
-			if (std::memcmp(block.data.data(), other.data.data(), block.data.size()) != 0) {
-				keptA.bytes += block.data.size();
-				keptA.blocks.push_back(std::move(block));
-
-				keptB.bytes += other.data.size();
-				keptB.blocks.push_back(std::move(other));
-			}
-		}
-
-		snapshotA.blocks.clear();
-		snapshotA.blocks.shrink_to_fit();
-		snapshotB.blocks.clear();
-		snapshotB.blocks.shrink_to_fit();
-
-		std::cout << "changed blocks = " << keptA.blocks.size()
-			<< " (" << (keptA.bytes / 1024 / 1024) << " MB)" << std::endl;
-
-		Sleep(600);
-
-		std::cout << "snapshot C ..." << std::endl;
-		const auto timeC = std::chrono::steady_clock::now();
-
-		DiffScanSnapshot snapshotC { };
-		for (const auto& block : keptB.blocks) {
-			DiffScanSnapshot::Block fresh { block.base, std::vector<std::uint8_t>(block.data.size()) };
-			if (memory->ReadRaw(fresh.base, fresh.data.data(), fresh.data.size()))
-				snapshotC.bytes += fresh.data.size();
-			else fresh.data.clear();
-
-			snapshotC.blocks.push_back(std::move(fresh));
-		}
-
-		const double dt1 = std::chrono::duration<double>(timeB - timeA).count();
-		const double dt2 = std::chrono::duration<double>(timeC - timeB).count();
-
-		std::cout << "snapshot C blocks = " << snapshotC.blocks.size()
-			<< ", dt1 = " << dt1 << "s, dt2 = " << dt2 << "s" << std::endl;
+		std::cout << "changed blocks = " << triple.a.blocks.size()
+			<< " (" << (triple.a.bytes / 1024 / 1024) << " MB)" << std::endl;
+		std::cout << "snapshot C blocks = " << triple.c.blocks.size()
+			<< ", dt1 = " << triple.dt1 << "s, dt2 = " << triple.dt2 << "s" << std::endl;
 
 		std::vector<DiffScanCandidate> floatCandidates { };
+		CollectFloatCandidates(triple, floatCandidates);
+
 		std::vector<DiffScanCandidate> doubleCandidates { };
 		std::vector<DiffScanCandidate> intCandidates { };
 
-		for (std::size_t blockIndex = 0; blockIndex < keptA.blocks.size(); ++blockIndex) {
-			const auto& blockA = keptA.blocks[blockIndex];
-			const auto& blockB = keptB.blocks[blockIndex];
-			const auto& blockC = snapshotC.blocks[blockIndex];
+		const double dt = (triple.dt1 + triple.dt2) * 0.5;
+
+		for (std::size_t blockIndex = 0; blockIndex < triple.a.blocks.size(); ++blockIndex) {
+			const auto& blockA = triple.a.blocks[blockIndex];
+			const auto& blockB = triple.b.blocks[blockIndex];
+			const auto& blockC = triple.c.blocks[blockIndex];
 
 			if (blockB.data.size() != blockA.data.size()) continue;
 			if (blockC.data.size() != blockA.data.size()) continue;
 
 			for (std::size_t offset = 0; offset + 4 <= blockA.data.size(); offset += 4) {
-				float fa { }, fb { }, fc { };
-				std::memcpy(&fa, blockA.data.data() + offset, sizeof(fa));
-				std::memcpy(&fb, blockB.data.data() + offset, sizeof(fb));
-				std::memcpy(&fc, blockC.data.data() + offset, sizeof(fc));
-
-				double delta = 0.0;
-				if (DiffScanSeries(fa, fb, fc, 0.01, 1000000.0, delta))
-					floatCandidates.push_back({ blockA.base + offset,
-						fa, fb, fc, delta / ((dt1 + dt2) * 0.5) });
-
 				std::int32_t ia { }, ib { }, ic { };
 				std::memcpy(&ia, blockA.data.data() + offset, sizeof(ia));
 				std::memcpy(&ib, blockB.data.data() + offset, sizeof(ib));
 				std::memcpy(&ic, blockC.data.data() + offset, sizeof(ic));
 
+				double delta = 0.0;
 				if (DiffScanSeries(static_cast<double>(ia), static_cast<double>(ib),
-					static_cast<double>(ic), 1.0, 1000000.0, delta))
+					static_cast<double>(ic), 1.0, 1000000.0, delta)
+					&& !DiffScanFloatBitsPlausible(static_cast<std::uint32_t>(ia))
+					&& !DiffScanFloatBitsPlausible(static_cast<std::uint32_t>(ib))
+					&& !DiffScanFloatBitsPlausible(static_cast<std::uint32_t>(ic)))
 					intCandidates.push_back({ blockA.base + offset,
 						static_cast<double>(ia), static_cast<double>(ib),
-						static_cast<double>(ic), delta / ((dt1 + dt2) * 0.5) });
+						static_cast<double>(ic), delta / dt });
 			}
 
 			for (std::size_t offset = 0; offset + 8 <= blockA.data.size(); offset += 8) {
@@ -299,10 +423,46 @@ static int RunDiffScan(void) {
 				std::memcpy(&dc, blockC.data.data() + offset, sizeof(dc));
 
 				double delta = 0.0;
-				if (DiffScanSeries(da, db, dc, 0.01, 1000000.0, delta))
-					doubleCandidates.push_back({ blockA.base + offset,
-						da, db, dc, delta / ((dt1 + dt2) * 0.5) });
+				if (DiffScanSeries(da, db, dc, 0.01, 1000000.0, delta)) {
+					const double velocity = delta / dt;
+
+					bool packedFloats = false;
+					if (std::abs(velocity) > 100.0) {
+						const double series[3] = { da, db, dc };
+						for (const double value : series) {
+							std::uint64_t bits = 0;
+							std::memcpy(&bits, &value, sizeof(bits));
+
+							if (DiffScanFloatBitsPlausible(static_cast<std::uint32_t>(bits >> 32))
+								|| DiffScanFloatBitsPlausible(static_cast<std::uint32_t>(bits & 0xFFFFFFFF))) {
+								packedFloats = true;
+								break;
+							}
+						}
+					}
+
+					if (!packedFloats) doubleCandidates.push_back({ blockA.base + offset,
+						da, db, dc, velocity });
+				}
 			}
+		}
+
+		std::ofstream csv("diffscan.csv", std::ios::trunc);
+		if (csv) {
+			csv << "type,address,v0,v1,v2,velocity" << '\n';
+
+			const auto writeType = [&](const char* const type,
+				const std::vector<DiffScanCandidate>& list) {
+				for (const auto& candidate : list)
+					csv << type << ",0x" << std::hex << candidate.address << std::dec << ','
+						<< std::setprecision(9) << candidate.v0 << ',' << candidate.v1
+						<< ',' << candidate.v2 << ',' << std::setprecision(6)
+						<< candidate.velocity << '\n';
+			};
+
+			writeType("float", floatCandidates);
+			writeType("double", doubleCandidates);
+			writeType("int32", intCandidates);
 		}
 
 		std::ostringstream report { };
@@ -315,7 +475,38 @@ static int RunDiffScan(void) {
 		std::ofstream file("diffscan.txt", std::ios::trunc);
 		if (file) {
 			file << report.str();
-			std::cout << "\n[saved] diffscan.txt" << std::endl;
+			std::cout << "\n[saved] diffscan.txt"
+				<< (csv ? ", diffscan.csv" : "") << std::endl;
+		}
+	}
+	catch (const std::exception& exception) {
+		std::cerr << exception.what() << std::endl;
+
+		delete memory;
+
+		return 1;
+	}
+
+	delete memory;
+
+	return 0;
+}
+
+static int RunRefs(const std::uintptr_t target) {
+	Memory::PMemory memory { };
+
+	try {
+		memory = new Memory::Memory();
+		memory->Attach(L"onmyoji.exe");
+
+		std::cout << "target = 0x" << std::hex << target << std::dec << std::endl;
+
+		const auto references = memory->ScanValue<std::uint64_t>(target);
+		std::cout << "references = " << references.size() << std::endl;
+
+		for (const auto& reference : references) {
+			std::cout << "\n[ref] 0x" << std::hex << reference << std::dec << std::endl;
+			HexDump(memory, reference >= 0x18 ? reference - 0x18 : reference, 0x38);
 		}
 	}
 	catch (const std::exception& exception) {
@@ -417,8 +608,288 @@ static int RunRecon(void) {
 	return 0;
 }
 
+// --dump: 按 4 字节字转储，同时给出 hex / float / int32 三种解释，用于逆向结构体布局
+static int RunDump(const std::uintptr_t address, const std::size_t size) {
+	Memory::PMemory memory { };
+
+	try {
+		memory = new Memory::Memory();
+		memory->Attach(L"onmyoji.exe");
+
+		const auto bytes = memory->ReadBytes(address, size);
+		if (bytes.empty()) {
+			std::cout << "<unreadable>" << std::endl;
+		}
+		else {
+			std::cout << "dump 0x" << std::hex << address << " .. +0x" << size << std::dec
+				<< " (" << bytes.size() << " bytes)" << std::endl;
+
+			for (std::size_t offset = 0; offset + 4 <= bytes.size(); offset += 4) {
+				std::uint32_t word = 0;
+				std::memcpy(&word, bytes.data() + offset, sizeof(word));
+
+				float asFloat = 0.0f;
+				std::memcpy(&asFloat, &word, sizeof(asFloat));
+
+				std::cout << "  +0x" << std::hex << std::setw(4) << std::setfill('0')
+					<< offset << std::dec << std::setfill(' ')
+					<< "  0x" << std::hex << std::setw(8) << word << std::dec
+					<< "  f=" << std::setw(14) << asFloat
+					<< "  i=" << std::setw(12) << static_cast<std::int32_t>(word)
+					<< std::endl;
+			}
+		}
+	}
+	catch (const std::exception& exception) {
+		std::cerr << exception.what() << std::endl;
+
+		delete memory;
+
+		return 1;
+	}
+
+	delete memory;
+
+	return 0;
+}
+
+// 地址规格: "addr" 单地址，或 "addr:stride:count" 展开为 addr + k*stride (k = 0..count-1)
+static std::vector<std::uintptr_t> ParseWatchAddresses(const std::vector<std::string>& specs) {
+	std::vector<std::uintptr_t> addresses { };
+
+	for (const auto& spec : specs) {
+		const auto first = spec.find(':');
+		if (first == std::string::npos) {
+			addresses.push_back(
+				static_cast<std::uintptr_t>(std::strtoull(spec.c_str(), nullptr, 16))
+			);
+
+			continue;
+		}
+
+		const auto second = spec.find(':', first + 1);
+		if (second == std::string::npos) continue;
+
+		const auto base = std::strtoull(spec.substr(0, first).c_str(), nullptr, 16);
+		const auto stride = std::strtoull(
+			spec.substr(first + 1, second - first - 1).c_str(), nullptr, 16
+		);
+		const auto count = std::strtoull(spec.substr(second + 1).c_str(), nullptr, 10);
+
+		for (std::uint64_t index = 0; index < count; ++index)
+			addresses.push_back(static_cast<std::uintptr_t>(base + index * stride));
+	}
+
+	return addresses;
+}
+
+// 监控循环: 轮询一组地址, 表格原地刷新, 显示当前值与相对上次轮询的变化量
+static int WatchLoop(
+	const Memory::PMemory memory,
+	const std::vector<std::uintptr_t>& addresses,
+	const std::vector<std::string>& labels,
+	const int intervalMs
+) {
+	const std::size_t count = addresses.size();
+	std::vector<float> current(count, 0.0f), previous(count, 0.0f);
+	std::vector<bool> ok(count, false), okPrevious(count, false);
+
+	// 启用 VT 转义序列，表格原地刷新；不支持时退化为滚动日志
+	HANDLE console = GetStdHandle(STD_OUTPUT_HANDLE);
+	DWORD mode = 0;
+	const bool vt = console != INVALID_HANDLE_VALUE
+		&& GetConsoleMode(console, &mode)
+		&& SetConsoleMode(console, mode | ENABLE_VIRTUAL_TERMINAL_PROCESSING);
+
+	std::cout << "watching " << count << " addresses every "
+		<< intervalMs << " ms (Ctrl+C 退出)" << std::endl;
+
+	bool drawn = false;
+	while (true) {
+		for (std::size_t index = 0; index < count; ++index) {
+			float value = 0.0f;
+
+			ok[index] = memory->TryRead(addresses[index], value);
+			if (ok[index]) current[index] = value;
+		}
+
+		if (vt && drawn) std::cout << "\x1b[" << count << "A";
+
+		for (std::size_t index = 0; index < count; ++index) {
+			std::cout << "  " << std::setw(8) << std::left << labels[index] << std::right
+				<< " 0x" << std::hex << addresses[index] << std::dec;
+
+			if (!ok[index]) {
+				std::cout << "  <unreadable>     ";
+			}
+			else if (!okPrevious[index]) {
+				std::cout << "  " << std::setw(14) << current[index] << "  (new)      ";
+			}
+			else {
+				const auto delta = current[index] - previous[index];
+
+				std::cout << "  " << std::setw(14) << current[index]
+					<< "  d=" << std::setw(11) << delta
+					<< (current[index] != previous[index] ? " *" : "  ");
+			}
+
+			std::cout << "\n";
+		}
+
+		std::cout.flush();
+		drawn = true;
+
+		for (std::size_t index = 0; index < count; ++index) {
+			previous[index] = current[index];
+			okPrevious[index] = ok[index];
+		}
+
+		Sleep(static_cast<DWORD>(intervalMs));
+	}
+}
+
+// --watch: 实时轮询一组地址，表格显示当前值与相对上次轮询的变化量，用于和屏幕画面对照
+static int RunWatch(const std::vector<std::string>& specs, const int intervalMs) {
+	const auto addresses = ParseWatchAddresses(specs);
+	if (addresses.empty()) {
+		std::cerr << "::Main no valid watch address." << std::endl;
+
+		return 1;
+	}
+
+	Memory::PMemory memory { };
+
+	try {
+		memory = new Memory::Memory();
+		memory->Attach(L"onmyoji.exe");
+	}
+	catch (const std::exception& exception) {
+		std::cerr << exception.what() << std::endl;
+
+		delete memory;
+
+		return 1;
+	}
+
+	std::vector<std::string> labels { };
+	for (std::size_t index = 0; index < addresses.size(); ++index) {
+		std::ostringstream label { };
+		label << '[' << std::setw(2) << std::setfill('0') << index << ']';
+
+		labels.push_back(label.str());
+	}
+
+	return WatchLoop(memory, addresses, labels, intervalMs);
+}
+
+// --autowatch: 自动定位同步变化组并实时监控
+// 小游戏每次进入都会重新分配对象导致地址变化, 因此每次运行先做快速三快照,
+// 按"B 时刻值完全相同"聚类找出每个数据的所有拷贝, 再直接监控各组代表地址
+static int RunAutoWatch(const int intervalMs) {
+	Memory::PMemory memory { };
+
+	try {
+		memory = new Memory::Memory();
+		memory->Attach(L"onmyoji.exe");
+	}
+	catch (const std::exception& exception) {
+		std::cerr << exception.what() << std::endl;
+
+		delete memory;
+
+		return 1;
+	}
+
+	try {
+		std::cout << "locating synchronized groups ..." << std::endl;
+
+		const auto regions = FilterWritableRegions(memory->GetRegions());
+		const auto triple = TakeTripleSnapshots(memory, regions, 400);
+
+		std::vector<DiffScanCandidate> candidates { };
+		CollectFloatCandidates(triple, candidates);
+
+		const auto groups = ClusterByValue(std::move(candidates));
+		if (groups.empty()) {
+			std::cerr << "no synchronized group found, "
+				<< "make sure the mini-game is running with characters moving."
+				<< std::endl;
+
+			delete memory;
+
+			return 1;
+		}
+
+		const std::size_t limit = std::min<std::size_t>(groups.size(), 12);
+
+		std::vector<std::uintptr_t> addresses { };
+		std::vector<std::string> labels { };
+
+		std::cout << "\nlocated " << groups.size() << " group(s), watching top "
+			<< limit << ":" << std::endl;
+
+		for (std::size_t index = 0; index < limit; ++index) {
+			const auto& group = groups[index];
+
+			addresses.push_back(group.address);
+			labels.push_back("G" + std::to_string(index) + "x" + std::to_string(group.copies));
+
+			std::cout << "  [G" << index << "] 0x" << std::hex << group.address << std::dec
+				<< "  copies = " << group.copies
+				<< ", v1 = " << std::setprecision(9) << group.v1
+				<< ", velocity = " << std::setprecision(6) << group.velocity
+				<< " /s" << std::endl;
+		}
+
+		std::cout << std::endl;
+
+		return WatchLoop(memory, addresses, labels, intervalMs);
+	}
+	catch (const std::exception& exception) {
+		std::cerr << exception.what() << std::endl;
+
+		delete memory;
+
+		return 1;
+	}
+}
+
 int main(const int argc, char* argv[]) {
-	if (argc > 1 && std::string(argv[1]) == "--diffscan") return RunDiffScan();
+	const std::vector<std::string> args(argv + 1, argv + argc);
+
+	if (!args.empty() && args[0] == "--diffscan") return RunDiffScan();
+
+	if (!args.empty() && args[0] == "--refs" && args.size() > 1) return RunRefs(
+		static_cast<std::uintptr_t>(std::strtoull(args[1].c_str(), nullptr, 16))
+	);
+
+	if (!args.empty() && args[0] == "--dump" && args.size() > 2) return RunDump(
+		static_cast<std::uintptr_t>(std::strtoull(args[1].c_str(), nullptr, 16)),
+		static_cast<std::size_t>(std::strtoull(args[2].c_str(), nullptr, 16))
+	);
+
+	if (!args.empty() && args[0] == "--watch" && args.size() > 1) {
+		int intervalMs = 250;
+		std::vector<std::string> specs { };
+
+		for (std::size_t index = 1; index < args.size(); ++index) {
+			if (args[index].rfind("--interval=", 0) == 0)
+				intervalMs = std::max(50, std::atoi(args[index].c_str() + 11));
+			else specs.push_back(args[index]);
+		}
+
+		return RunWatch(specs, intervalMs);
+	}
+
+	if (!args.empty() && args[0] == "--autowatch") {
+		int intervalMs = 250;
+
+		for (std::size_t index = 1; index < args.size(); ++index)
+			if (args[index].rfind("--interval=", 0) == 0)
+				intervalMs = std::max(50, std::atoi(args[index].c_str() + 11));
+
+		return RunAutoWatch(intervalMs);
+	}
 
 	return RunRecon();
 }
