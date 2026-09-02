@@ -7,3 +7,5 @@ cd D:\CppProduct\ntdll-usermode-ram-read-write\Build
 .\ntdll-usermode-ram-read-write.exe --autowatch
 
 .\ntdll-usermode-ram-read-write.exe  --diffscan
+
+.\ntdll-usermode-ram-read-write.exe --track onmyoji.exe+4E8839C --interval=25

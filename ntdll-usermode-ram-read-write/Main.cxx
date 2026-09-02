@@ -4,6 +4,7 @@
 #include <cmath>
 #include <chrono>
 #include <cstring>
+#include <ctime>
 #include <fstream>
 #include <sstream>
 #include <string>
@@ -854,6 +855,250 @@ static int RunAutoWatch(const int intervalMs) {
 	}
 }
 
+// ---- track: 抓取单个地址的变化过程 ------------------------------------
+
+// 解析 CE 表格地址: "onmyoji.exe+4E8839C" -> (模块名, 偏移); "7FF6B2B1839C" -> (空模块, 绝对地址)
+static bool ParseCtAddress(
+	const std::string& spec, std::wstring& module, std::uintptr_t& offset
+) {
+	const auto plus = spec.find('+');
+	if (plus == std::string::npos) {
+		module.clear();
+
+		offset = static_cast<std::uintptr_t>(std::strtoull(spec.c_str(), nullptr, 16));
+		return offset != 0;
+	}
+
+	if (plus == 0 || plus + 1 >= spec.size()) return false;
+
+	module.assign(spec.begin(), spec.begin() + plus);
+	offset = static_cast<std::uintptr_t>(std::strtoull(spec.c_str() + plus + 1, nullptr, 16));
+
+	return offset != 0;
+}
+
+static std::string WallClockNow(void) {
+	const auto now = std::chrono::system_clock::now();
+	const auto milliseconds = std::chrono::duration_cast<std::chrono::milliseconds>(
+		now.time_since_epoch()) % 1000;
+	const std::time_t seconds = std::chrono::system_clock::to_time_t(now);
+
+	std::tm local { };
+	localtime_s(&local, &seconds);
+
+	std::ostringstream stream { };
+	stream << std::put_time(&local, "%H:%M:%S")
+		<< '.' << std::setw(3) << std::setfill('0') << milliseconds.count();
+
+	return stream.str();
+}
+
+// 按 4 字节字输出十六进制, markOffset 处的字加方括号标出目标值
+static std::string WordsToHex(
+	const std::uint8_t* data, const std::size_t size, const std::size_t markOffset
+) {
+	std::ostringstream stream { };
+	for (std::size_t offset = 0; offset + 4 <= size; offset += 4) {
+		std::uint32_t word = 0;
+		std::memcpy(&word, data + offset, sizeof(word));
+
+		if (offset == markOffset) stream << '[';
+		stream << std::hex << std::setw(8) << std::setfill('0') << word;
+		if (offset == markOffset) stream << ']';
+
+		stream << ' ';
+	}
+
+	return stream.str();
+}
+
+// --track: 抓取单个地址的变化过程
+// 地址支持 CE 表格格式 "模块+偏移"(如 onmyoji.exe+4E8839C)或绝对十六进制地址;
+// 高频轮询目标 4 字节及其前后上下文窗口, 每次变化记录时间戳/原始字节/float/int32 解释,
+// 结果同步写入 track.log 与 track.csv, 用于离线分析加密数值(如对局剩余怪物数)的变化规律
+static int RunTrack(const std::string& spec, const int intervalMs) {
+	std::wstring module { };
+	std::uintptr_t offset = 0;
+	if (!ParseCtAddress(spec, module, offset)) {
+		std::cerr << "::Main invalid track spec '" << spec
+			<< "', expected 'module+hexoffset' or hex address." << std::endl;
+
+		return 1;
+	}
+
+	Memory::PMemory memory { };
+
+	try {
+		memory = new Memory::Memory();
+		memory->Attach(L"onmyoji.exe");
+	}
+	catch (const std::exception& exception) {
+		std::cerr << exception.what() << std::endl;
+
+		delete memory;
+
+		return 1;
+	}
+
+	std::uintptr_t address = offset, moduleBase = 0;
+	if (!module.empty()) {
+		try {
+			moduleBase = memory->GetModule(module);
+			address = moduleBase + offset;
+		}
+		catch (const std::exception& exception) {
+			std::cerr << exception.what() << std::endl;
+
+			delete memory;
+
+			return 1;
+		}
+	}
+
+	// 目标 4 字节置于窗口中部, 前后各带一段上下文: 加密值的密钥/关联字段常在邻近位置
+	constexpr std::size_t kTargetSize = 4;
+	const std::size_t before = std::min<std::size_t>(0x10, address);
+	const std::size_t windowSize = before + kTargetSize + 0x0C;
+	const std::size_t targetOffset = before;
+
+	std::ofstream log("track.log", std::ios::app);
+	std::ofstream csv("track.csv", std::ios::app);
+	if (csv) csv << "index,kind,wall,elapsed_ms,raw_old,raw_new,"
+		"float_old,float_new,int_old,int_new,context\n";
+
+	{
+		std::ostringstream session { };
+		session << "==== track " << spec << " target=0x" << std::hex << address
+			<< std::dec << " interval=" << intervalMs << "ms"
+			<< " window=[0x" << std::hex << (address - before) << ", 0x"
+			<< (address - before + windowSize) << ")" << std::dec << " ====";
+
+		std::cout << session.str() << std::endl;
+		if (log) log << session.str() << '\n';
+	}
+
+	if (moduleBase) std::cout << "module base = 0x" << std::hex << moduleBase
+		<< std::dec << std::endl;
+
+	std::vector<std::uint8_t> previous(windowSize, 0), current(windowSize, 0);
+	bool hasPrevious = false, previousOk = false;
+
+	const auto startTime = std::chrono::steady_clock::now();
+	auto lastEntryTime = startTime;
+
+	std::uint64_t index = 0;
+
+	// 记录一条变化: kind 为 INIT(初始)/VAL(目标 4 字节变化)/CTX(仅上下文变化)
+	const auto emitEntry = [&](const char* const kind, const long long elapsedMs) {
+		std::uint32_t oldRaw = 0, newRaw = 0;
+		std::memcpy(&oldRaw, previous.data() + targetOffset, sizeof(oldRaw));
+		std::memcpy(&newRaw, current.data() + targetOffset, sizeof(newRaw));
+
+		float oldFloat = 0.0f, newFloat = 0.0f;
+		std::memcpy(&oldFloat, &oldRaw, sizeof(oldFloat));
+		std::memcpy(&newFloat, &newRaw, sizeof(newFloat));
+
+		const auto oldInt = static_cast<std::int32_t>(oldRaw);
+		const auto newInt = static_cast<std::int32_t>(newRaw);
+
+		const std::string wall = WallClockNow();
+		const std::string context = WordsToHex(current.data(), windowSize, targetOffset);
+		const std::uint64_t entryIndex = index++;
+
+		std::ostringstream line { };
+		line << '#' << entryIndex << " [" << wall << "] +" << elapsedMs << "ms " << kind
+			<< "  0x" << std::hex << std::setw(8) << std::setfill('0') << oldRaw
+			<< " -> 0x" << std::setw(8) << newRaw << std::setfill(' ') << std::dec
+			<< "  f " << oldFloat << " -> " << newFloat
+			<< "  i " << oldInt << " -> " << newInt;
+
+		if (kind[0] == 'V') line << "  di " << std::showpos << (newInt - oldInt) << std::noshowpos;
+
+		std::cout << line.str() << "\n    ctx " << context << std::endl;
+
+		if (log) log << line.str() << "\n    ctx " << context << '\n';
+
+		if (csv) csv << entryIndex << ',' << kind << ',' << wall << ',' << elapsedMs
+			<< ",0x" << std::hex << std::setw(8) << std::setfill('0') << oldRaw
+			<< ",0x" << std::setw(8) << newRaw << std::setfill(' ') << std::dec << ','
+			<< oldFloat << ',' << newFloat << ',' << oldInt << ',' << newInt
+			<< ',' << context << '\n';
+	};
+
+	std::cout << "tracking every " << intervalMs << " ms (Ctrl+C 退出)" << std::endl;
+
+	while (true) {
+		const bool ok = memory->ReadRaw(address - before, current.data(), windowSize);
+
+		const auto now = std::chrono::steady_clock::now();
+		const auto elapsedMs = std::chrono::duration_cast<std::chrono::milliseconds>(
+			now - startTime).count();
+
+		if (!ok) {
+			// 读取失败只在 恢复->失败 边沿记录一次, 恢复后按普通变化处理
+			if (previousOk) {
+				std::ostringstream line { };
+				line << '#' << index++ << " [" << WallClockNow() << "] +"
+					<< elapsedMs << "ms ERR  <unreadable>";
+
+				std::cout << line.str() << std::endl;
+				if (log) log << line.str() << '\n';
+			}
+
+			previousOk = false;
+
+			Sleep(static_cast<DWORD>(intervalMs));
+			continue;
+		}
+
+		if (!hasPrevious) {
+			previous = current;
+
+			hasPrevious = true;
+			previousOk = true;
+
+			emitEntry("INIT", elapsedMs);
+			lastEntryTime = now;
+
+			Sleep(static_cast<DWORD>(intervalMs));
+			continue;
+		}
+
+		if (std::memcmp(previous.data(), current.data(), windowSize) != 0) {
+			const bool targetChanged = std::memcmp(
+				previous.data() + targetOffset, current.data() + targetOffset, kTargetSize
+			) != 0;
+
+			emitEntry(targetChanged ? "VAL" : "CTX", elapsedMs);
+
+			previous = current;
+			lastEntryTime = now;
+		}
+		else if (std::chrono::duration_cast<std::chrono::milliseconds>(
+			now - lastEntryTime).count() >= 5000) {
+			// 心跳: 长时间无变化时每 5s 报告一次当前值, 便于确认仍在抓取
+			std::uint32_t raw = 0;
+			std::memcpy(&raw, current.data() + targetOffset, sizeof(raw));
+
+			float value = 0.0f;
+			std::memcpy(&value, &raw, sizeof(value));
+
+			std::ostringstream line { };
+			line << "#  [" << WallClockNow() << "] +" << elapsedMs << "ms HB  0x"
+				<< std::hex << std::setw(8) << std::setfill('0') << raw
+				<< std::setfill(' ') << std::dec
+				<< "  f " << value << "  i " << static_cast<std::int32_t>(raw);
+
+			std::cout << line.str() << std::endl;
+			if (log) log << line.str() << '\n';
+
+			lastEntryTime = now;
+		}
+
+		Sleep(static_cast<DWORD>(intervalMs));
+	}
+}
+
 int main(const int argc, char* argv[]) {
 	const std::vector<std::string> args(argv + 1, argv + argc);
 
@@ -867,6 +1112,16 @@ int main(const int argc, char* argv[]) {
 		static_cast<std::uintptr_t>(std::strtoull(args[1].c_str(), nullptr, 16)),
 		static_cast<std::size_t>(std::strtoull(args[2].c_str(), nullptr, 16))
 	);
+
+	if (!args.empty() && args[0] == "--track" && args.size() > 1) {
+		int intervalMs = 25;
+
+		for (std::size_t index = 2; index < args.size(); ++index)
+			if (args[index].rfind("--interval=", 0) == 0)
+				intervalMs = std::max(5, std::atoi(args[index].c_str() + 11));
+
+		return RunTrack(args[1], intervalMs);
+	}
 
 	if (!args.empty() && args[0] == "--watch" && args.size() > 1) {
 		int intervalMs = 250;
