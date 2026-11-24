@@ -11,7 +11,11 @@
         指针, 再按字节模式 (memchr 加速) 批量定位对象, 不硬编码任何地址
       - 类型指针合理性过滤: CPython 类型对象是模块静态数据, 指针必须落在
         onmyoji.exe / python27.dll 映像范围内, 剔除数据巧合造成的假指针
-      - watch: 逐帧差分, x 持续递减 (屏幕上右->左) 且速度稳定者为行走式神,
+      - watch: 逐帧差分 + 位置法轨迹跟踪 (引擎每帧把坐标广播进几十份临时
+        拷贝, 地址当帧失效, 按地址跟踪无效): 每帧按 x 聚类折叠镜像 ->
+        跨帧预测匹配 (pred = lastX + vx*(缺席+dt)); 轨迹观测满 3 帧才写
+        CSV 并补写历史行; 常数家族黑名单剔除批量写入常量; 停帧 (dt>2.5s)
+        只重建快照不产出脏行; 道具/式神由轨迹级 y 范围判定;
         归属坐标对象前后 0x300 字节内最近的式神 ID 整型对象
       - gwlist: 转储 16KB 滑窗内含 >=5 个不同池内 ID 的缓冲区 (对应
         BaiGuiYeXingMember.bgyx_onGetWalkListAsw 下发的行走列表);
@@ -36,6 +40,7 @@
 #include <set>
 #include <sstream>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 namespace GhostWalk {
@@ -386,8 +391,11 @@ namespace GhostWalk {
             bool poolMatch;
             double vx;
             std::size_t samples;
-            std::size_t entityObs = 0; // 匹配到的实体被观测帧数 (噪声过滤用)
-            std::size_t entityIndex = 0; // 匹配到的实体编号 (1 起)
+            std::size_t entityObs = 0;   // 所属轨迹被观测帧数 (噪声过滤用)
+            std::size_t entityIndex = 0; // 所属轨迹编号 (1 起, 0=未入轨/停帧)
+            std::size_t groupRows = 0;   // 所属簇行数 (镜像折叠规模)
+            double trackYRange = 0.0;    // 轨迹级 y 范围 (道具判定)
+            double dtSec = 0.0;          // 本帧与上一帧真实间隔 (秒)
         };
 
         // 坐标对象前后 0x300 字节内最近的式神 ID: 优先取官方表内存在的 ID
@@ -662,8 +670,32 @@ namespace GhostWalk {
             std::ofstream csv;
             if (!options.csvPath.empty()) {
                 csv.open(options.csvPath, std::ios::trunc);
-                if (csv) csv << "time,channel,addr,hero_id,hero_name,pool_match,x,vx_units_per_s,samples,y_range,item,entity_obs\n";
+                if (csv) csv << "time,channel,addr,hero_id,hero_name,pool_match,x,"
+                    "vx_units_per_s,samples,y_range,item,entity_obs,"
+                    "entity_index,y,group_rows,track_y_range,dt_s\n";
             }
+
+            // 行级 CSV 写出 (entity_index=0 表示未入轨: D 通道行或停帧帧)
+            auto writeRow = [&csv](const MoverRow& row) {
+                if (!csv) return;
+
+                csv << row.time << ',' << row.channel
+                    << ",0x" << std::hex << row.address << std::dec << ','
+                    << (row.hasHero ? std::to_string(row.heroId) : "") << ','
+                    << row.heroName << ','
+                    << (row.poolMatch ? 1 : 0) << ','
+                    << std::fixed << std::setprecision(4) << row.x << ','
+                    << std::setprecision(2) << row.vx << ','
+                    << row.samples << ','
+                    << std::setprecision(2) << row.yRange << ','
+                    << (row.item ? 1 : 0) << ','
+                    << row.entityObs << ','
+                    << row.entityIndex << ','
+                    << std::setprecision(2) << row.y << ','
+                    << row.groupRows << ','
+                    << std::setprecision(2) << row.trackYRange << ','
+                    << std::setprecision(2) << row.dtSec << '\n';
+            };
 
             std::cout << "[*] 开始逐帧追踪, Ctrl+C 退出. (vx<0 即 x 递减 = 屏幕上右->左)"
                 << std::endl << std::endl;
@@ -682,22 +714,42 @@ namespace GhostWalk {
             std::unordered_map<std::uintptr_t, std::uint64_t> intsAll;
             std::size_t lastDCount = 0;
 
-            // 实体注册表: 一轮百鬼夜行共 36 只式神 (可重复), 按位置连续性跨帧跟踪
-            // 预测 x = lastX + vx*dt; 连续缺席 kMissLimit 帧 => 已离场
-            struct Entity {
-                double lastX = 0.0, lastY = 0.0, vx = 0.0;
+            // 轨迹 = 跨帧连续的同一逻辑实体 (式神或道具)。
+            // 行走名单由服务器下发 (bgyx_onGetWalkListAsw), 每轮数量可变, 不硬编码 36
+            struct Track {
+                std::size_t id = 0;
+                double firstX = 0.0, lastX = 0.0, lastY = 0.0, vx = 0.0;
+                double yMin = 1e30, yMax = -1e30; // 轨迹级 y 范围 (道具判定)
                 std::uint64_t heroId = 0;
                 std::string heroName;
                 bool hasHero = false;
                 std::size_t observations = 0;
-                std::size_t missed = 0;
+                double missedTime = 0.0;   // 按真实秒数累计的缺席时长
                 bool finished = false;
+                bool flushed = false;      // 观测满 kFlushObs 帧后开始写 CSV
+                std::vector<MoverRow> pending; // 确认前的行缓存 (确认后补写)
                 std::string firstTime, lastTime;
             };
 
-            std::vector<Entity> entities;
-            constexpr double kMatchRadius = 30.0;
-            constexpr std::size_t kMissLimit = 3;
+            std::vector<Track> tracks;
+            std::size_t trackSeq = 0;
+
+            // 常数家族黑名单: 同一 float32 位模式出现在多个地址且跨多帧
+            // (0.0 / -489.9161 / ±1 / ±6 / 87.0 等批量写入常量)。
+            // 镜像拷贝组只存活 1 帧, 达不到 "跨多帧" 判据, 不会误伤
+            std::unordered_map<std::uint32_t,
+                std::pair<std::unordered_set<std::uintptr_t>,
+                    std::unordered_set<std::uint64_t>>> constHist;
+            constexpr std::size_t kConstAddrLimit = 16;
+            constexpr std::size_t kConstTickLimit = 5;
+
+            // 位置跟踪参数
+            constexpr double kClusterGap = 3.0;        // x 相邻行归簇间距
+            constexpr std::size_t kClusterRowCap = 60; // 簇行数上限 (超过=噪声带)
+            constexpr std::size_t kFlushObs = 3;       // 轨迹确认帧数 (持久性门槛)
+            constexpr double kTrackTimeout = 12.0;     // 缺席超时 (秒, 按 dt 累计)
+            constexpr double kGapFrameDt = 2.5;        // 停帧判定阈值 (秒)
+            constexpr double kMatchRadius = 30.0;      // 匹配半径 (按 |vx|*时长 放大)
 
             while (true) {
                 const auto scanStart = std::chrono::steady_clock::now();
@@ -705,6 +757,9 @@ namespace GhostWalk {
                 previousScan = scanStart;
 
                 const bool dTick = (tick % 3 == 1) || tick <= 2;
+
+                // 停帧判定: 真实帧间隔超阈值 (如读取阻塞 23s), 跨帧累计变化失真
+                const bool gapFrame = dt > kGapFrameDt;
 
                 if (dTick) {
                     current.clear();
@@ -728,14 +783,27 @@ namespace GhostWalk {
                 std::vector<MoverRow> rows { };
 
                 // 通道 F: 快照差分 -- 与上一帧快照字节逐点比较, 不建中间大表
-                std::size_t f32Changed = 0;
+                std::size_t f32Changed = 0, f32Partial = 0, constDropped = 0;
                 for (const auto& region : f32Regions) {
                     auto data = ReadRegion(memory, region);
                     if (data.size() < 8) continue;
 
+                    // 读取不完整 (8MB 分块中途失败): 保留旧快照, 本帧跳过该区域。
+                    // 旧实现把部分数据写回快照, 下一帧尺寸仍不匹配 -> 连续两帧无法差分
+                    if (data.size() != region.size()) {
+                        ++f32Partial;
+                        continue;
+                    }
+
                     auto& prev = f32Prev[region.base];
                     if (prev.size() != data.size()) {
                         // 首帧或区域尺寸变化: 仅建立快照, 不扫描
+                        prev = std::move(data);
+                        continue;
+                    }
+
+                    // 停帧: 跨帧累计变化失真, 只刷新快照 (下一帧差分基线正确)
+                    if (gapFrame) {
                         prev = std::move(data);
                         continue;
                     }
@@ -804,9 +872,26 @@ namespace GhostWalk {
                         row.vx = vx;
                         row.samples = series.size();
                         row.time = WallClockNow();
+                        row.dtSec = dt;
 
                         // 屏幕坐标过滤: 剔除世界坐标/相机 (x≈9390/19262 等)
                         if (row.x < -500.0 || row.x > 2000.0) continue;
+
+                        // 常数家族黑名单: 达标 (多地址 + 跨多帧) 后该值不再产出
+                        {
+                            std::uint32_t xbits { };
+                            std::memcpy(&xbits, &now, sizeof(xbits));
+
+                            auto& entry = constHist[xbits];
+                            entry.first.insert(row.address);
+                            entry.second.insert(tick);
+
+                            if (entry.first.size() >= kConstAddrLimit
+                                && entry.second.size() >= kConstTickLimit) {
+                                ++constDropped;
+                                continue;
+                            }
+                        }
 
                         if (const auto hero = NearestHero(intKeys, intsAll, heroNames,row.address)) {
                             row.hasHero = true;
@@ -834,111 +919,213 @@ namespace GhostWalk {
                     ++f32Changed;
                 }
 
-                // 实体注册表匹配: 预测 x = lastX + vx*dt (新实体首帧不预测)
-                std::vector<char> matched(entities.size(), 0);
+                // ============ 位置法轨迹跟踪 (主跟踪器, 替代按地址的实体注册表) ============
+                // 引擎每帧把坐标广播进几十份临时拷贝, 地址当帧失效, 按地址跟踪
+                // 注定失败。改为: 每帧按 x 聚类折叠镜像 -> 跨帧预测匹配
+                // (pred = lastX + vx*(缺席时长+dt)) -> 轨迹级维护 y 范围/速度/英雄,
+                // 观测满 kFlushObs 帧才写 CSV 并补写历史行 (持久性门槛)。
+                // 行走名单由服务器下发 (bgyx_onGetWalkListAsw), 每轮数量可变;
+                // 每只式神速度独立 (getHeroWalkSpeed + BGYX_SPEED_FIX_MIN/MAX
+                // 随机化 + FairModelSpeedFactor 全局因子), 故不硬编码总数,
+                // 也不设全局统一速度门限。
+                std::size_t flushedRows = 0, droppedClusterRows = 0;
 
-                for (auto& row : rows) {
-                    if (row.channel != 'F' || row.item) continue;
+                if (!gapFrame) {
+                    // -- 1. F 行按 x 聚类: 链式合并间距 < kClusterGap 的行,
+                    //       折叠同一式神的镜像拷贝; 行数超限的簇是锯齿噪声带, 整簇丢弃
+                    struct Cluster { double cx = 0, cy = 0; std::vector<MoverRow*> rws; };
+                    std::vector<Cluster> clusters;
 
-                    std::size_t best = SIZE_MAX;
-                    double bestDistance = 0.0;
+                    {
+                        std::vector<MoverRow*> frows;
+                        for (auto& r : rows)
+                            if (r.channel == 'F') frows.push_back(&r);
 
-                    for (std::size_t index = 0; index < entities.size(); ++index) {
-                        const auto& entity = entities[index];
-                        if (entity.finished) continue;
+                        std::sort(frows.begin(), frows.end(),
+                            [](const MoverRow* l, const MoverRow* r) {
+                                return l->x < r->x;
+                            });
 
-                        const auto predicted = entity.lastX
-                            + (entity.observations > 1 ? entity.vx * dt : 0.0);
-                        const auto distance = std::abs(row.x - predicted);
-                        if (distance < kMatchRadius
-                            && (best == SIZE_MAX || distance < bestDistance)) {
-                            best = index;
-                            bestDistance = distance;
+                        for (std::size_t i = 0; i < frows.size();) {
+                            std::size_t j = i + 1;
+                            double sumX = frows[i]->x, sumY = frows[i]->y;
+
+                            while (j < frows.size()
+                                && frows[j]->x - frows[j - 1]->x < kClusterGap) {
+                                sumX += frows[j]->x;
+                                sumY += frows[j]->y;
+                                ++j;
+                            }
+
+                            if (j - i > kClusterRowCap) {
+                                droppedClusterRows += j - i;
+                                i = j;
+                                continue;
+                            }
+
+                            Cluster c;
+                            c.cx = sumX / static_cast<double>(j - i);
+                            c.cy = sumY / static_cast<double>(j - i);
+                            c.rws.reserve(j - i);
+                            for (std::size_t k = i; k < j; ++k) c.rws.push_back(frows[k]);
+                            clusters.push_back(std::move(c));
+                            i = j;
                         }
                     }
 
-                    if (best == SIZE_MAX) {
-                        Entity entity;
-                        entity.lastX = row.x;
-                        entity.lastY = row.y;
-                        entity.vx = row.vx;
-                        entity.heroId = row.heroId;
-                        entity.heroName = row.heroName;
-                        entity.hasHero = row.hasHero;
-                        entity.observations = 1;
-                        entity.firstTime = row.time;
-                        entity.lastTime = row.time;
+                    // 行归属: 轨迹确认 (kFlushObs 帧) 前缓存, 确认后补写历史行
+                    auto attach = [&](Track& tr, Cluster& c) {
+                        if (tr.observations >= 1) {
+                            const auto instantVx =
+                                (c.cx - tr.lastX) / (tr.missedTime + dt);
+                            tr.vx = tr.vx * 0.5 + instantVx * 0.5;
+                        }
 
-                        entities.push_back(std::move(entity));
-                        matched.push_back(1); // 新实体本帧已观测, 保持 matched 与 entities 同长
+                        tr.lastX = c.cx;
+                        tr.lastY = c.cy;
+                        tr.lastTime = c.rws.front()->time;
+                        ++tr.observations;
+                        tr.missedTime = 0;
 
-                        row.entityIndex = entities.size();
-                        row.entityObs = 1;
+                        for (const auto* r : c.rws) {
+                            tr.yMin = std::min(tr.yMin, static_cast<double>(r->y));
+                            tr.yMax = std::max(tr.yMax, static_cast<double>(r->y));
 
-                        std::cout << "  [新入场] 实体#" << entities.size()
-                            << " @x=" << std::fixed << std::setprecision(1) << row.x
-                            << (row.hasHero ? " ID=" + std::to_string(row.heroId)
-                                + (row.heroName.empty() ? "" : "(" + row.heroName + ")") : "")
-                            << std::endl;
-                        continue;
-                    }
+                            if (!tr.hasHero && r->hasHero) {
+                                tr.hasHero = true;
+                                tr.heroId = r->heroId;
+                                tr.heroName = r->heroName;
+                            }
+                        }
 
-                    auto& entity = entities[best];
-                    if (dt > 0.0) {
-                        const auto instantVx = (row.x - entity.lastX) / dt;
-                        entity.vx = entity.vx * 0.5 + instantVx * 0.5;
-                    }
-                    entity.lastX = row.x;
-                    entity.lastY = row.y;
-                    entity.lastTime = row.time;
-                    if (row.hasHero) {
-                        entity.heroId = row.heroId;
-                        entity.heroName = row.heroName;
-                        entity.hasHero = true;
-                    }
-                    if (!matched[best]) {
-                        matched[best] = 1;
-                        ++entity.observations;
-                    }
-                    row.entityIndex = best + 1;
-                    row.entityObs = entity.observations;
-                }
+                        const bool itemTrack = (tr.yMax - tr.yMin) > options.yVar;
 
-                // 缺席判定: 连续 kMissLimit 帧未观测 => 已离场
-                matched.resize(entities.size(), 1);
+                        for (const auto* r : c.rws) {
+                            r->entityIndex = tr.id;
+                            r->entityObs = tr.observations;
+                            r->groupRows = c.rws.size();
+                            r->trackYRange = tr.yMax - tr.yMin;
+                            r->item = itemTrack;
+                        }
 
-                for (std::size_t index = 0; index < entities.size(); ++index) {
-                    auto& entity = entities[index];
-                    if (entity.finished) continue;
+                        if (tr.flushed) {
+                            for (const auto* r : c.rws) {
+                                writeRow(*r);
+                                ++flushedRows;
+                            }
+                        }
+                        else {
+                            for (const auto* r : c.rws) tr.pending.push_back(*r);
 
-                    if (!matched[index]) {
-                        ++entity.missed;
-                        if (entity.missed > kMissLimit) {
-                            entity.finished = true;
+                            if (tr.observations >= kFlushObs) {
+                                for (const auto& r : tr.pending) {
+                                    writeRow(r);
+                                    ++flushedRows;
+                                }
 
-                            std::cout << "  [已离场] 实体#" << (index + 1)
-                                << " ID=" << (entity.hasHero
-                                    ? std::to_string(entity.heroId)
-                                    + (entity.heroName.empty()
-                                        ? "" : "(" + entity.heroName + ")") : "?")
-                                << " 共观测 " << entity.observations << " 帧"
-                                << std::endl;
+                                tr.pending.clear();
+                                tr.pending.shrink_to_fit();
+                                tr.flushed = true;
+                            }
+                        }
+                    };
+
+                    // -- 2. 簇 -> 已有轨迹: 预测位置贪心匹配 (只接受向左运动) --
+                    struct Cand { std::size_t ti, ci; double d; };
+                    std::vector<Cand> cands;
+
+                    for (std::size_t ti = 0; ti < tracks.size(); ++ti) {
+                        const auto& tr = tracks[ti];
+                        if (tr.finished) continue;
+
+                        const auto pred = tr.lastX
+                            + (tr.observations > 1
+                                ? tr.vx * (tr.missedTime + dt) : 0.0);
+                        const auto radius = std::max(kMatchRadius,
+                            std::abs(tr.vx) * (tr.missedTime + dt) * 1.5 + 8.0);
+
+                        for (std::size_t ci = 0; ci < clusters.size(); ++ci) {
+                            if (clusters[ci].cx > pred + 6.0) continue; // 右移=噪声
+
+                            const auto d = std::abs(clusters[ci].cx - pred);
+                            if (d < radius) cands.push_back({ ti, ci, d });
                         }
                     }
-                    else entity.missed = 0;
+
+                    std::sort(cands.begin(), cands.end(),
+                        [](const Cand& l, const Cand& r) { return l.d < r.d; });
+
+                    std::vector<char> trackUsed(tracks.size(), 0);
+                    std::vector<char> cluUsed(clusters.size(), 0);
+
+                    for (const auto& c : cands) {
+                        if (trackUsed[c.ti] || cluUsed[c.ci]) continue;
+
+                        trackUsed[c.ti] = 1;
+                        cluUsed[c.ci] = 1;
+                        attach(tracks[c.ti], clusters[c.ci]);
+                    }
+
+                    // -- 3. 未匹配簇 -> 新轨迹 --
+                    for (std::size_t ci = 0; ci < clusters.size(); ++ci) {
+                        if (cluUsed[ci]) continue;
+
+                        Track tr;
+                        tr.id = ++trackSeq;
+                        tr.lastX = tr.firstX = clusters[ci].cx;
+                        tr.lastY = clusters[ci].cy;
+                        tr.vx = clusters[ci].rws.front()->vx;
+                        tr.firstTime = tr.lastTime = clusters[ci].rws.front()->time;
+
+                        tracks.push_back(std::move(tr));
+                        attach(tracks.back(), clusters[ci]);
+                    }
+
+                    // -- 4. 未匹配轨迹: 按真实秒数累计缺席, 超时判离场 --
+                    for (std::size_t ti = 0; ti < tracks.size(); ++ti) {
+                        auto& tr = tracks[ti];
+                        if (tr.finished || trackUsed[ti]) continue;
+
+                        tr.missedTime += dt;
+
+                        if (tr.missedTime > kTrackTimeout) {
+                            tr.finished = true;
+
+                            // 未确认 (观测 < kFlushObs) 的轨迹视为噪声, 静默丢弃
+                            if (tr.observations >= kFlushObs) {
+                                std::cout << "  [离场] 轨迹#" << tr.id
+                                    << (tr.hasHero
+                                        ? " " + std::to_string(tr.heroId)
+                                            + (tr.heroName.empty()
+                                                ? "" : "·" + tr.heroName)
+                                        : "")
+                                    << " 共观测 " << tr.observations << " 帧"
+                                    << std::fixed << std::setprecision(1)
+                                    << " x " << tr.firstX << "->" << tr.lastX
+                                    << " yRange " << (tr.yMax - tr.yMin)
+                                    << ((tr.yMax - tr.yMin) > options.yVar
+                                        ? " [道具]" : "")
+                                    << " (" << tr.firstTime << " -> "
+                                    << tr.lastTime << ")" << std::endl;
+                            }
+                        }
+                    }
                 }
 
                 ++tick;
 
                 std::size_t aliveCount = 0, goneCount = 0;
-                for (const auto& entity : entities)
-                    (entity.finished ? ++goneCount : ++aliveCount);
+                for (const auto& tr : tracks)
+                    (tr.finished ? ++goneCount : ++aliveCount);
 
                 // 每帧一行心跳, 长扫描阶段不再静默
                 std::cout << "[帧" << tick << "] F 变化区域 " << f32Changed
+                    << (f32Partial
+                        ? " (部分读失败区域 " + std::to_string(f32Partial) + ")"
+                        : std::string())
                     << ", D 浮点 " << lastDCount
-                    << ", 存活 " << aliveCount << ", 已离场 " << goneCount
-                    << " (合计 " << entities.size() << ")" << std::endl;
+                    << ", 轨迹 存活 " << aliveCount << " 离场 " << goneCount
+                    << " (累计 " << tracks.size() << ")" << std::endl;
 
                 // 首帧校验缓存类型指针有效性 (游戏重启后模块基址变化会使缓存失效)
                 if (tick == 1 && fromCache && current.size() < 20) {
@@ -951,7 +1138,8 @@ namespace GhostWalk {
                 }
 
                 // 通道 D: PyFloatObject double (Python 逻辑值), 降频比较
-                if (dTick && !previous.empty() && dt > 0.0) {
+                // (Python float 每次赋值都是新对象, 地址必然翻腾, 此通道仅作参考)
+                if (dTick && !previous.empty() && dt > 0.0 && !gapFrame) {
                     for (const auto& entry : current) {
                         const auto found = previous.find(entry.first);
                         if (found == previous.end()) continue;
@@ -975,6 +1163,7 @@ namespace GhostWalk {
                         row.vx = (deltaSum / dt) / static_cast<double>(series.size());
                         row.samples = series.size();
                         row.time = WallClockNow();
+                        row.dtSec = dt;
 
                         if (const auto hero = NearestHero(intKeys, intsAll, heroNames,entry.first)) {
                             row.hasHero = true;
@@ -996,86 +1185,47 @@ namespace GhostWalk {
                             if (known != heroNames.end()) row.heroName = known->second;
                         }
 
-                        rows.push_back(row);
+                        writeRow(row);
                     }
                 }
 
-                // 实体聚类: x 相近 + y 相近的行归为同一实体
-                // (同一式神的多份拷贝 / 叠放的道具), 组数即场上非道具实体数
-                std::size_t ghostGroups = 0;
-                {
-                    std::vector<const MoverRow*> frows;
-                    for (const auto& r : rows)
-                        if (r.channel == 'F' && !r.item)
-                            frows.push_back(&r);
+                // 帧摘要: 行数/黑名单与噪声簇丢弃/写出行数 + 存活轨迹表
+                // (F 行已在轨迹确认后写盘, 此处不再整批写 CSV)
+                std::cout << "[" << WallClockNow() << "] 帧" << tick
+                    << " dt=" << std::fixed << std::setprecision(2) << dt << "s"
+                    << " 行 " << rows.size()
+                    << " (常数黑名单-" << constDropped
+                    << " 噪声簇-" << droppedClusterRows
+                    << " 写出 " << flushedRows << ")"
+                    << " | 轨迹 存活 " << aliveCount
+                    << " 离场 " << goneCount
+                    << " 累计 " << tracks.size()
+                    << std::endl;
 
-                    std::sort(frows.begin(), frows.end(),
-                        [](const MoverRow* left, const MoverRow* right) {
-                            return left->x < right->x;
-                        });
-
-                    for (std::size_t i = 0; i < frows.size();) {
-                        std::size_t j = i + 1;
-                        const auto repX = frows[i]->x;
-                        const auto repY = frows[i]->y;
-
-                        while (j < frows.size()
-                            && frows[j]->x - repX < 2.5
-                            && std::abs(static_cast<double>(frows[j]->y) - repY) < 15.0)
-                            ++j;
-
-                        ++ghostGroups; // 一段 x/y 相近的行 = 1 只式神
-                        i = j;
-                    }
-                }
-
-                if (!rows.empty()) {
-                    // 实体级汇总: 只列被观测 >=2 帧的实体 (一帧即逝的地址是噪声)
-                    std::cout << "[" << WallClockNow() << "] 帧" << tick
-                        << "  行 " << rows.size() << ", 疑似式神 " << ghostGroups
-                        << ":" << std::endl;
-
-                    std::cout << "    " << std::left << std::setw(8) << "实体"
-                        << std::setw(28) << "ID·名称" << std::setw(11) << "x"
-                        << std::setw(10) << "vx/秒" << std::setw(6) << "帧数"
-                        << " 入场时间" << std::right << std::endl;
-
-                    for (std::size_t index = 0; index < entities.size(); ++index) {
-                        const auto& entity = entities[index];
-                        if (entity.observations < 2 || entity.finished) continue;
+                if (!gapFrame) {
+                    for (const auto& tr : tracks) {
+                        if (tr.finished || tr.observations < 2) continue;
 
                         std::ostringstream label { };
-                        label << '#' << (index + 1);
-                        if (entity.hasHero) {
-                            label << ' ' << entity.heroId;
-                            if (!entity.heroName.empty()) label << '·' << entity.heroName;
+                        label << '#' << tr.id;
+                        if (tr.hasHero) {
+                            label << ' ' << tr.heroId;
+                            if (!tr.heroName.empty()) label << '·' << tr.heroName;
                         }
                         else label << " ?";
 
-                        std::cout << "    " << std::left << std::setw(8) << label.str()
+                        std::cout << "    " << std::left << std::setw(10) << label.str()
                             << std::right << std::fixed << std::setprecision(1)
-                            << std::setw(11) << entity.lastX
-                            << std::setw(10) << entity.vx
-                            << std::setw(6) << entity.observations
-                            << "  " << entity.firstTime << std::endl;
+                            << " x=" << std::setw(8) << tr.lastX
+                            << " vx=" << std::setprecision(2) << std::setw(7) << tr.vx
+                            << " obs=" << tr.observations
+                            << " yRange=" << std::setprecision(1)
+                            << (tr.yMax - tr.yMin)
+                            << ((tr.yMax - tr.yMin) > options.yVar ? " [道具]" : "")
+                            << "  " << tr.firstTime << std::endl;
                     }
 
                     std::cout << std::endl;
-                }
-
-                // 行级明细只写 CSV (含 entity_obs 列, 离线可按实体过滤噪声)
-                for (const auto& row : rows) {
-                    if (csv) csv << row.time << ',' << row.channel
-                        << ",0x" << std::hex << row.address << std::dec << ','
-                        << (row.hasHero ? std::to_string(row.heroId) : "") << ','
-                        << row.heroName << ','
-                        << (row.poolMatch ? 1 : 0) << ','
-                        << std::fixed << std::setprecision(4) << row.x << ','
-                        << std::setprecision(2) << row.vx << ','
-                        << row.samples << ','
-                        << std::setprecision(2) << row.yRange << ','
-                        << (row.item ? 1 : 0) << ','
-                        << row.entityObs << '\n';
                 }
 
                 if (dTick) previous = std::move(current);
