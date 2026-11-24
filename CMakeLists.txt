@@ -18,6 +18,7 @@ endif()
 add_executable(${PROJECT_NAME}
         ntdll-usermode-ram-read-write/Main.cxx
         ntdll-usermode-ram-read-write/Memory/Memory.cxx
+        ntdll-usermode-ram-read-write/GhostWalk/GhostWalk.cxx
 )
 
 target_include_directories(${PROJECT_NAME} PRIVATE ntdll-usermode-ram-read-write)

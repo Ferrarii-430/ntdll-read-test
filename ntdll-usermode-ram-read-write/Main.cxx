@@ -12,6 +12,7 @@
 #include <unordered_map>
 
 #include "Memory/Memory.hxx"
+#include "GhostWalk/GhostWalk.hxx"
 
 static void HexDump(
 	const Memory::PMemory memory, const std::uintptr_t address, const std::size_t size
@@ -1099,8 +1100,69 @@ static int RunTrack(const std::string& spec, const int intervalMs) {
 	}
 }
 
+// --ghostwalk/--gwlist 公共选项: --interval=ms --pool=id,id,... --csv=path
+static GhostWalk::Options ParseGhostWalkOptions(const std::vector<std::string>& args) {
+	GhostWalk::Options options { };
+
+	for (std::size_t index = 1; index < args.size(); ++index) {
+		const auto& argument = args[index];
+
+		if (argument.rfind("--interval=", 0) == 0) {
+			options.intervalMs = std::max(50, std::atoi(argument.c_str() + 11));
+		}
+		else if (argument.rfind("--pool=", 0) == 0) {
+			options.pool.clear();
+
+			std::stringstream stream(argument.substr(7));
+			std::string token { };
+
+			while (std::getline(stream, token, ','))
+				if (token.size()) options.pool.push_back(
+					std::strtoull(token.c_str(), nullptr, 10));
+		}
+		else if (argument.rfind("--csv=", 0) == 0) {
+			options.csvPath = argument.substr(6);
+		}
+		else if (argument.rfind("--yvar=", 0) == 0) {
+			options.yVar = std::atof(argument.c_str() + 7);
+		}
+		else if (argument.rfind("--names=", 0) == 0) {
+			options.namesPath = argument.substr(8);
+		}
+		else if (argument == "--rediscover") {
+			options.rediscover = true;
+		}
+	}
+
+	if (options.pool.empty()) {
+		// 默认式神池: 玩家配置 baigui_hero_full
+		for (const auto id : { 384, 593, 514, 515, 516, 518,
+			520, 419, 405, 407, 404, 406, 611 }) options.pool.push_back(id);
+	}
+
+	return options;
+}
+
 int main(const int argc, char* argv[]) {
+	// 源码字面量为 UTF-8 (/utf-8 编译), 控制台输出码页切到 UTF-8 避免中文乱码
+	SetConsoleOutputCP(CP_UTF8);
+
+	// 关闭 QuickEdit: 鼠标点击窗口会进入选择态并阻塞 stdout,
+	// 表现为工具卡住、按任意键才继续
+	if (const HANDLE console = GetStdHandle(STD_OUTPUT_HANDLE);
+		console != INVALID_HANDLE_VALUE) {
+		DWORD mode = 0;
+		if (GetConsoleMode(console, &mode)) SetConsoleMode(console,
+			(mode | ENABLE_EXTENDED_FLAGS) & ~ENABLE_QUICK_EDIT_MODE);
+	}
+
 	const std::vector<std::string> args(argv + 1, argv + argc);
+
+	if (!args.empty() && args[0] == "--ghostwalk") return GhostWalk::RunWatch(
+		ParseGhostWalkOptions(args));
+
+	if (!args.empty() && args[0] == "--gwlist") return GhostWalk::RunWalkList(
+		ParseGhostWalkOptions(args));
 
 	if (!args.empty() && args[0] == "--diffscan") return RunDiffScan();
 

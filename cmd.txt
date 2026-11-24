@@ -9,3 +9,9 @@ cd D:\CppProduct\ntdll-usermode-ram-read-write\Build
 .\ntdll-usermode-ram-read-write.exe  --diffscan
 
 .\ntdll-usermode-ram-read-write.exe --track onmyoji.exe+4E8839C --interval=25
+
+.\ntdll-usermode-ram-read-write.exe --ghostwalk --interval=800 --csv=ghostwalk.csv --rediscover
+
+.\ntdll-usermode-ram-read-write.exe --gwlist --rediscover
+
+.\ntdll-usermode-ram-read-write.exe --ghostwalk --pool=384,593,514,515,516,518,520,419,405,407,404,406,611
