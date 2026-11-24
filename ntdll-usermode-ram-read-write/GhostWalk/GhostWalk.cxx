@@ -1081,6 +1081,10 @@ namespace GhostWalk {
                         attach(tracks.back(), clusters[ci]);
                     }
 
+                    // 本帧新入场的轨迹: 扩容 trackUsed 并记为已观测 (1)。
+                    // 否则步骤 4 的 trackUsed[ti] 越界 -> vector subscript out of range
+                    trackUsed.resize(tracks.size(), 1);
+
                     // -- 4. 未匹配轨迹: 按真实秒数累计缺席, 超时判离场 --
                     for (std::size_t ti = 0; ti < tracks.size(); ++ti) {
                         auto& tr = tracks[ti];
