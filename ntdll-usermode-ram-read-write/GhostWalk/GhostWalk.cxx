@@ -790,7 +790,7 @@ namespace GhostWalk {
 
                     // 读取不完整 (8MB 分块中途失败): 保留旧快照, 本帧跳过该区域。
                     // 旧实现把部分数据写回快照, 下一帧尺寸仍不匹配 -> 连续两帧无法差分
-                    if (data.size() != region.size()) {
+                    if (data.size() != region.size) {
                         ++f32Partial;
                         continue;
                     }
@@ -1000,7 +1000,7 @@ namespace GhostWalk {
 
                         const bool itemTrack = (tr.yMax - tr.yMin) > options.yVar;
 
-                        for (const auto* r : c.rws) {
+                        for (auto* r : c.rws) {
                             r->entityIndex = tr.id;
                             r->entityObs = tr.observations;
                             r->groupRows = c.rws.size();
