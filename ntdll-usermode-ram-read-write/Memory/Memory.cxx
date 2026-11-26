@@ -160,6 +160,24 @@ namespace Memory {
         return status >= 0 && readed == size;
     }
 
+    std::size_t Memory::ReadPartial(
+        const std::uintptr_t address, void* buffer, const std::size_t size
+    ) const {
+        if (!_handle) throw std::runtime_error(
+            "::Memory read no access, ::_handle missing."
+        );
+
+        if (!address || !buffer || !size) return 0;
+
+        SIZE_T readed = 0;
+        // 部分拷贝返回 STATUS_PARTIAL_COPY (负值), 但 readed 字节有效
+        __NtdllApi::NtReadVirtualMemory(
+            _handle, reinterpret_cast<PVOID>(address), buffer, size, &readed
+        );
+
+        return static_cast<std::size_t>(readed);
+    }
+
     std::vector<std::uint8_t> Memory::ReadBytes(
         const std::uintptr_t address, const std::size_t size
     ) const {

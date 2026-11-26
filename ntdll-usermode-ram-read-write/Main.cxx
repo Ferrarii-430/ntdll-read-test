@@ -1129,6 +1129,12 @@ static GhostWalk::Options ParseGhostWalkOptions(const std::vector<std::string>& 
 		else if (argument.rfind("--names=", 0) == 0) {
 			options.namesPath = argument.substr(8);
 		}
+		else if (argument == "--freeze") {
+			options.freezeOnHit = true;
+		}
+		else if (argument.rfind("--freeze=", 0) == 0) {
+			options.freezeOnHit = argument.substr(9) == "1";
+		}
 		else if (argument == "--rediscover") {
 			options.rediscover = true;
 		}
@@ -1162,6 +1168,21 @@ int main(const int argc, char* argv[]) {
 		ParseGhostWalkOptions(args));
 
 	if (!args.empty() && args[0] == "--gwlist") return GhostWalk::RunWalkList(
+		ParseGhostWalkOptions(args));
+
+	if (!args.empty() && args[0] == "--gwstate") return GhostWalk::RunStateChase(
+		ParseGhostWalkOptions(args));
+
+	if (!args.empty() && args[0] == "--gwparse") return GhostWalk::RunGwParse(
+		ParseGhostWalkOptions(args));
+
+	if (!args.empty() && args[0] == "--gwfind") return GhostWalk::RunGwFind(
+		ParseGhostWalkOptions(args));
+
+	if (!args.empty() && args[0] == "--gwwatch") return GhostWalk::RunGwWatch(
+		ParseGhostWalkOptions(args));
+
+	if (!args.empty() && args[0] == "--gwtype") return GhostWalk::RunGwType(
 		ParseGhostWalkOptions(args));
 
 	if (!args.empty() && args[0] == "--diffscan") return RunDiffScan();

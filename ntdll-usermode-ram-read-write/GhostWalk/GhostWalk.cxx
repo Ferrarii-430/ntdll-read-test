@@ -91,21 +91,269 @@ namespace GhostWalk {
             return value;
         }
 
-        // 读取整个区域, 8MB 分块; 失败时返回已读部分 (与 Python 版容错一致)
+        // 读取整个区域, 8MB 分块, 容错部分拷贝: 失败块以 0xCC 占位保持
+        // 总尺寸恒定 (帧间差分对齐); 连续 2 块全失败才提前终止
         std::vector<std::uint8_t> ReadRegion(const PMemory memory, const Region& region) {
             std::vector<std::uint8_t> data;
             data.reserve(region.size);
 
             constexpr std::size_t kChunk = 8ull * 1024 * 1024;
+            std::size_t misses = 0;
             for (std::size_t offset = 0; offset < region.size; offset += kChunk) {
                 const auto size = std::min(kChunk, region.size - offset);
                 std::vector<std::uint8_t> chunk(size);
 
-                if (!memory->ReadRaw(region.base + offset, chunk.data(), size)) break;
-                data.insert(data.end(), chunk.begin(), chunk.end());
+                const auto got = memory->ReadPartial(
+                    region.base + offset, chunk.data(), size);
+
+                if (got == 0) {
+                    if (++misses >= 2) break;
+                    data.insert(data.end(), size, 0xCC);
+                    continue;
+                }
+
+                misses = 0;
+                data.insert(data.end(), chunk.begin(), chunk.begin() + got);
+                if (got < size) data.insert(data.end(), size - got, 0xCC);
             }
 
             return data;
+        }
+
+        // 用户态模块镜像经验区间: onmyoji.exe 与内嵌 Python 静态数据均在
+        // 0x7ff6xx/0x7ff7xx (见 gw_types.txt); 堆 (0x000001d6..) 与无效
+        // 哨兵 (0xffff..ff) 均被排除
+        constexpr std::uintptr_t kImageLo = 0x7FF000000000ull;
+        constexpr std::uintptr_t kImageHi = 0x800000000000ull;
+
+        bool PlausibleStatic(const std::uintptr_t value) {
+            return value >= kImageLo && value < kImageHi;
+        }
+
+        // NtSuspendProcess / NtResumeProcess: 进程冻结/恢复 (ntdll 动态加载)
+        NTSTATUS NtSuspendProcessHandle(const HANDLE handle) {
+            const auto* const fn = reinterpret_cast<NTSTATUS (NTAPI*) (HANDLE)>(
+                GetProcAddress(GetModuleHandleW(L"ntdll.dll"),
+                    "NtSuspendProcess"));
+
+            return fn ? fn(handle) : static_cast<NTSTATUS>(-1);
+        }
+
+        NTSTATUS NtResumeProcessHandle(const HANDLE handle) {
+            const auto* const fn = reinterpret_cast<NTSTATUS (NTAPI*) (HANDLE)>(
+                GetProcAddress(GetModuleHandleW(L"ntdll.dll"),
+                    "NtResumeProcess"));
+
+            return fn ? fn(handle) : static_cast<NTSTATUS>(-1);
+        }
+
+        // 紧凑 ASCII str: len@+16 (1..32), data@+48, NUL 结尾;
+        // 严格标识符子集 (dict 键 / entries 自定位用)
+        bool IsIdentifierStr(const std::uint8_t* data, const std::size_t size,
+            std::string& out) {
+            if (size < 96) return false;
+
+            const auto length = U64At(data, 16);
+            if (length < 1 || length > 32) return false;
+            if (length + 48 > size) return false;
+
+            out.clear();
+
+            for (std::size_t index = 0; index < length; ++index) {
+                const auto ch = data[48 + index];
+                if (!((ch >= 'a' && ch <= 'z') || (ch >= 'A' && ch <= 'Z')
+                    || (ch >= '0' && ch <= '9') || ch == '_')) return false;
+                out.push_back(static_cast<char>(ch));
+            }
+
+            return data[48 + length] == 0;
+        }
+
+        // 宽松文本 str (dict 值用): 长度至多 256, 允许可打印字符与 UTF-8 字节,
+        // 显示截断 80 字符
+        bool IsTextStr(const std::uint8_t* data, const std::size_t size,
+            std::string& out) {
+            if (size < 48) return false;
+
+            const auto length = U64At(data, 16);
+            if (length < 1 || length > 256) return false;
+            if (length + 48 > size) return false;
+
+            out.clear();
+
+            for (std::size_t index = 0; index < length; ++index) {
+                const auto ch = data[48 + index];
+                if (ch < 0x20 && ch != '\t') return false;
+                if (out.size() < 80) out.push_back(static_cast<char>(ch));
+            }
+
+            return data[48 + length] == 0;
+        }
+
+        // 值解释: str / PyLong (ob_size 有号, 30-bit limbs, digits@+24) /
+        // PyFloat (double@+16) / 原始
+        std::string DescribeValue(const PMemory memory, const std::uintptr_t value) {
+            const auto vdata = memory->ReadBytes(value, 96);
+            if (vdata.size() < 16) return "(不可读)";
+
+            if (vdata.size() < 32) {
+                // None/True/False 等 16 字节常量单例
+                std::ostringstream val { };
+                val << "常量单例(type=0x" << std::hex
+                    << U64At(vdata.data(), 8) << std::dec << ")";
+
+                return val.str();
+            }
+
+            std::string text;
+            if (IsTextStr(vdata.data(), vdata.size(), text)) {
+                return "str(" + text + ")";
+            }
+
+            const auto vLen = U64At(vdata.data(), 16);
+            const auto signedLen = static_cast<std::int64_t>(vLen);
+
+            // PyLong: ob_size=0 -> 0; 1..4 正数; -1..-4 负数
+            if (signedLen >= -4 && signedLen <= 4) {
+                const auto limbs = U64At(vdata.data(), 24);
+                const auto magnitude =
+                    (limbs & 0xFFFFFFFFull) + ((limbs >> 32) << 30);
+                const auto signedValue = static_cast<std::int64_t>(magnitude);
+
+                return "int(" + std::to_string(signedLen < 0 ? -signedValue
+                    : (signedLen == 0 ? 0 : signedValue)) + ")";
+            }
+
+            std::ostringstream val { };
+            val << std::fixed << std::setprecision(4) << F64At(vdata.data(), 16)
+                << " raw=0x" << std::hex << vLen << std::dec;
+
+            return val.str();
+        }
+
+        // dict 形状校验 (无需 PyDict_Type): ma_used@+16 in [1,60],
+        // ma_keys@+32 (兼容 +24) -> dk_refcnt>0, dk_log2_size 合理,
+        // dk_nentries >= ma_used
+        bool LooksLikeDict(const PMemory memory, const std::vector<std::uint8_t>& head) {
+            if (head.size() < 48) return false;
+
+            const auto used = U64At(head.data(), 16);
+            if (used < 1 || used > 60) return false;
+
+            for (const auto keysOff : { std::uintptr_t { 32 }, std::uintptr_t { 24 } }) {
+                const auto keys = U64At(head.data(), keysOff);
+                if (keys < 0x10000) continue;
+
+                const auto kdata = memory->ReadBytes(keys, 64);
+                if (kdata.size() < 64) continue;
+
+                const auto dkRefcnt = U64At(kdata.data(), 0);
+                if (dkRefcnt < 1 || dkRefcnt > 0x100000) continue;
+
+                const auto dkLog2Size = kdata[8];
+                if (dkLog2Size < 3 || dkLog2Size > 16) continue;
+
+                const auto dkNentries = U64At(kdata.data(), 24);
+                if (dkNentries < used || dkNentries > 4096) continue;
+
+                return true;
+            }
+
+            return false;
+        }
+
+        // 解析并转储单个 dict: 头部 -> ma_keys 数据块 -> entries 自定位 ->
+        // stride 投票 -> 逐槽 键名=值
+        void DumpDictEntries(const PMemory memory, std::ostream& txt,
+            const std::uintptr_t dictAddress, const std::string& label) {
+            const auto head = memory->ReadBytes(dictAddress, 64);
+            if (head.size() < 64) return;
+
+            const auto used = U64At(head.data(), 16);
+            const auto keys = U64At(head.data(), 32);
+
+            txt << "-- " << label << " @0x" << std::hex << dictAddress
+                << std::dec << " ma_used=" << used << "\n";
+
+            const auto kdata = memory->ReadBytes(keys, 2048);
+            if (kdata.size() < 256) return;
+
+            // entries 起点: keys 对象内首个指向合法标识符 str 的指针
+            std::size_t entriesOff = 0;
+            bool haveEntries = false;
+
+            for (std::size_t off = 32; off + 32 <= kdata.size(); off += 8) {
+                const auto key = U64At(kdata.data(), off);
+                if (key < 0x10000) continue;
+
+                const auto sdata = memory->ReadBytes(key, 96);
+                std::string keyName;
+                if (!IsIdentifierStr(sdata.data(), sdata.size(), keyName)) continue;
+
+                entriesOff = off;
+                haveEntries = true;
+                break;
+            }
+
+            if (!haveEntries) {
+                txt << "   (entries 不可解析)\n";
+                return;
+            }
+
+            // stride 判定: 投票法 -- entriesOff 已自对齐到首个 me_key;
+            // 16B 布局 (me_key/me_value) 第 k 个 key 在 entriesOff + k*16,
+            // 24B 布局 (含 me_hash) 在 entriesOff + k*24; 对 k=1..3 验证
+            // 是否为标识符 str, 取命中多者 (平票取 24B 标准布局)
+            std::size_t stride = 24;
+            {
+                std::size_t score16 = 0;
+                std::size_t score24 = 0;
+
+                for (std::size_t k = 1; k <= 3; ++k) {
+                    const auto off16 = entriesOff + k * 16;
+                    const auto off24 = entriesOff + k * 24;
+
+                    if (off16 + 8 <= kdata.size()) {
+                        const auto probe = U64At(kdata.data(), off16);
+                        if (probe >= 0x10000) {
+                            const auto sdata = memory->ReadBytes(probe, 96);
+                            std::string probeName;
+                            if (IsIdentifierStr(sdata.data(), sdata.size(), probeName))
+                                ++score16;
+                        }
+                    }
+
+                    if (off24 + 8 <= kdata.size()) {
+                        const auto probe = U64At(kdata.data(), off24);
+                        if (probe >= 0x10000) {
+                            const auto sdata = memory->ReadBytes(probe, 96);
+                            std::string probeName;
+                            if (IsIdentifierStr(sdata.data(), sdata.size(), probeName))
+                                ++score24;
+                        }
+                    }
+                }
+
+                if (score16 > score24) stride = 16;
+            }
+
+            txt << "   entries@+" << entriesOff << " stride=" << stride << "\n";
+
+            for (std::size_t slot = 0; slot < used; ++slot) {
+                const auto entryOff = entriesOff + slot * stride;
+                if (entryOff + stride > kdata.size()) break;
+
+                const auto key = U64At(kdata.data(), entryOff);
+                const auto value = U64At(kdata.data(), entryOff + 8);
+                if (!key || !value) continue;
+
+                const auto sdata = memory->ReadBytes(key, 96);
+                std::string keyName;
+                if (!IsIdentifierStr(sdata.data(), sdata.size(), keyName)) continue;
+
+                txt << "   " << keyName << " = " << DescribeValue(memory, value)
+                    << " @0x" << std::hex << value << std::dec << "\n";
+            }
         }
 
         bool Qualify(const std::vector<std::uint8_t>& data) {
@@ -1297,6 +1545,83 @@ namespace GhostWalk {
             const auto outputRoot = std::filesystem::path("yys_walklist_dump");
             std::filesystem::create_directories(outputRoot);
 
+            // 代码对象区域: 围绕百鬼方法名/字段名字符串转储整个所属区域,
+            // 供离线解析 PyCodeObject 的 names/consts (Python 3.11 布局,
+            // 指针按各转储文件的基址解析) -- 目标: walk list 的 dict 键名
+            {
+                static const char* const needles[] = {
+                    "bgyx_onGetWalkListAsw",
+                    "bgyx_hash_list",
+                    "bgyx_onSelectGuiWang",
+                    "get_pos_in_polyline",
+                    "walk_pos_list",
+                    "walk_pos_tuple",
+                };
+
+                struct CodeHit { std::size_t regionIndex; const char* what; std::size_t offset; };
+                std::vector<CodeHit> codeHits;
+                std::set<std::size_t> dumpRegions;
+
+                for (std::size_t regionIndex = 0;
+                    regionIndex < qualified.size(); ++regionIndex) {
+                    const auto data = ReadRegion(memory, qualified[regionIndex]);
+
+                    for (const auto* needle : needles) {
+                        const auto length = std::strlen(needle);
+                        if (data.size() < length) continue;
+
+                        std::size_t found = 0;
+                        for (std::size_t offset = 0;
+                            offset + length <= data.size(); ++offset) {
+                            if (std::memcmp(data.data() + offset, needle, length) == 0) {
+                                codeHits.push_back({ regionIndex, needle, offset });
+                                dumpRegions.insert(regionIndex);
+                                if (++found >= 16) break; // 每模式每区域限 16 处
+                            }
+                        }
+                    }
+                }
+
+                std::size_t codeSaved = 0;
+                for (const auto regionIndex : dumpRegions) {
+                    if (codeSaved >= 12) break; // 总量限 12 个区域
+
+                    const auto& region = qualified[regionIndex];
+                    const auto data = ReadRegion(memory, region);
+                    const auto size = std::min<std::size_t>(data.size(), 64u << 20);
+
+                    std::ostringstream name { };
+                    name << "coderegion_"
+                        << std::setw(2) << std::setfill('0') << codeSaved
+                        << '_' << std::hex << std::setw(12) << std::setfill('0')
+                        << region.base << std::dec;
+
+                    std::ofstream bin(outputRoot / (name.str() + ".bin"),
+                        std::ios::binary | std::ios::trunc);
+                    bin.write(reinterpret_cast<const char*>(data.data()),
+                        static_cast<std::streamsize>(size));
+                    bin.close();
+
+                    std::ofstream txt(outputRoot / (name.str() + ".txt"), std::ios::trunc);
+                    txt << "region=0x" << std::hex << region.base
+                        << " size=0x" << size << std::dec
+                        << " (指针 P 属于本区域当且仅当 base <= P < base+size)\n\n";
+
+                    for (const auto& hit : codeHits) {
+                        if (hit.regionIndex != regionIndex) continue;
+                        txt << "  " << hit.what << " @ 0x" << std::hex
+                            << (region.base + hit.offset) << std::dec << '\n';
+                    }
+
+                    ++codeSaved;
+                    std::cout << "[+] 代码区域转储 " << name.str() << ".bin"
+                        << std::endl;
+                }
+
+                std::cout << "[*] 代码对象区域转储完成, 共 " << codeSaved
+                    << " 个" << std::endl;
+            }
+
             std::size_t saved = 0;
 
             // 扫描模式: 原始 int32 数组 (行走列表的主要形式) +
@@ -1470,6 +1795,1359 @@ namespace GhostWalk {
 
             std::cout << "[*] 完成, 共 " << saved << " 个缓冲区 -> "
                 << outputRoot.string() << std::endl;
+        }
+        catch (const std::exception& exception) {
+            std::cerr << exception.what() << std::endl;
+
+            delete memory;
+
+            return 1;
+        }
+
+        delete memory;
+
+        return 0;
+    }
+
+    // --gwstate: 指针追踪转储 (方案1 采集阶段) -- 锚定状态同步键/单例属性/
+    // 代码对象名字符串, 追踪引用它们的区域并级联转储; 目标: 补齐
+    // bgyx_onGetWalkListAsw 代码对象及其 consts, 提取 lsw 元素 dict 键名
+    int RunStateChase(const Options& options) {
+        PMemory memory { };
+
+        try {
+            memory = new Memory::Memory();
+            memory->Attach(L"onmyoji.exe");
+        }
+        catch (const std::exception& exception) {
+            std::cerr << exception.what() << std::endl;
+
+            delete memory;
+
+            return 1;
+        }
+
+        try {
+            std::cout << "[*] 枚举区域并建立锚点 ..." << std::endl;
+
+            const auto qualified = CollectQualifiedRegions(memory);
+            std::cout << "[*] 含百鬼标识区域: " << qualified.size() << std::endl;
+
+            static const char* const anchors[] = {
+                "bgyx_onGetWalkListAsw", "bgyx_onGetWalkList", "bgyx_hash_list",
+                "bgyx_onSelectGuiWang", "get_pos_in_polyline",
+                "walk_pos_list", "walk_pos_tuple",
+                "rewardHeroList", "hashList", "friendCache", "walkList",
+                "israteup", "ex_params", "otherplayer", "act_type",
+                "plotindex", "isstart", "hero_cards_count",
+                "born_hero_cards_count", "currentFriendData",
+            };
+
+            struct Anchor {
+                std::uintptr_t address;
+                std::size_t regionIndex;
+                const char* what;
+                std::size_t offset;
+            };
+
+            std::vector<std::vector<std::uint8_t>> regionData(qualified.size());
+            std::vector<Anchor> anchorList;
+            std::unordered_map<std::uintptr_t, std::size_t> anchorIndex;
+
+            for (std::size_t regionIndex = 0;
+                regionIndex < qualified.size(); ++regionIndex) {
+                const auto& region = qualified[regionIndex];
+                regionData[regionIndex] = ReadRegion(memory, region);
+                const auto& data = regionData[regionIndex];
+
+                for (const auto* needle : anchors) {
+                    const auto length = std::strlen(needle);
+                    if (data.size() < length) continue;
+
+                    FindAll(data.data(), data.size(),
+                        reinterpret_cast<const std::uint8_t*>(needle), length,
+                        [&](const std::size_t offset) {
+                            anchorIndex[region.base + offset] = anchorList.size();
+                            anchorList.push_back({ region.base + offset,
+                                regionIndex, needle, offset });
+                        });
+                }
+            }
+
+            std::cout << "[*] 锚点: " << anchorList.size() << " 处 ("
+                << qualified.size() << " 个区域已读入内存)" << std::endl;
+
+            regionData.clear(); // 释放读入的 GB 级数据, 追踪阶段流式扫描
+            regionData.shrink_to_fit();
+
+            // 阶段 2: 指针追踪 -- 扫描全部可读区域 (引用方多不含百鬼标识);
+            // 指针指向对象头而非数据区 (本 build str data@+48), 按 value+k 探测
+            const auto all = CollectReadableRegions(memory);
+
+            std::vector<const Region*> hitRegions;
+            constexpr std::size_t kChunk = 8ull * 1024 * 1024;
+            constexpr std::size_t kScanCap = 64ull * 1024 * 1024;
+
+            std::size_t progressBytes = 0, nextProgress = 1024ull * 1024 * 1024;
+
+            for (const auto& region : all) {
+                const auto size = std::min<std::size_t>(
+                    static_cast<std::size_t>(region.size), kScanCap);
+                if (size < 8) continue;
+
+                bool hit = false;
+
+                for (std::size_t done = 0; done < size && !hit; done += kChunk) {
+                    const auto span = std::min(kChunk, size - done);
+                    const auto data = memory->ReadBytes(region.base + done, span);
+                    if (data.size() < 8) break;
+
+                    for (std::size_t offset = 0; offset + 8 <= data.size(); offset += 8) {
+                        const auto value = U64At(data.data(), offset);
+                        if (!value) continue;
+
+                        for (const auto k : { 0ull, 16ull, 24ull,
+                            32ull, 36ull, 40ull, 48ull }) {
+                            if (!anchorIndex.count(value + k)) continue;
+
+                            hit = true;
+                            break;
+                        }
+
+                        if (hit) break;
+                    }
+                }
+
+                progressBytes += size;
+
+                if (progressBytes >= nextProgress) {
+                    std::cout << "    [限定] 已扫 " << progressBytes / (1024 * 1024)
+                        << " MB, 命中区域 " << hitRegions.size() << std::endl;
+                    nextProgress += 1024ull * 1024 * 1024;
+                }
+
+                if (hit) hitRegions.push_back(&region);
+            }
+
+            std::cout << "[*] 追踪命中区域: " << hitRegions.size() << std::endl;
+
+            // 阶段 3: 转储命中区域 + 锚点区域 (去重, 限 16 个, 各 <=64MB)
+            const auto outputRoot = std::filesystem::path("yys_walklist_dump");
+            std::filesystem::create_directories(outputRoot);
+
+            std::set<std::uintptr_t> dumpedBases;
+            std::size_t stateSaved = 0;
+
+            const auto dumpOne = [&](const Region& region) -> void {
+                if (stateSaved >= 40 || dumpedBases.count(region.base)) return;
+
+                const auto data = ReadRegion(memory, region);
+                const auto size = std::min<std::size_t>(data.size(), 64u << 20);
+
+                std::ostringstream name { };
+                name << "state_"
+                    << std::setw(2) << std::setfill('0') << stateSaved
+                    << '_' << std::hex << std::setw(12) << std::setfill('0')
+                    << region.base << std::dec;
+
+                std::ofstream bin(outputRoot / (name.str() + ".bin"),
+                    std::ios::binary | std::ios::trunc);
+                bin.write(reinterpret_cast<const char*>(data.data()),
+                    static_cast<std::streamsize>(size));
+                bin.close();
+
+                std::ofstream txt(outputRoot / (name.str() + ".txt"), std::ios::trunc);
+                txt << "region=0x" << std::hex << region.base
+                    << " size=0x" << size << std::dec
+                    << " (指针 P 属于本区域当且仅当 base <= P < base+size)\n\n"
+                    << "-- 本区域内锚点\n";
+
+                for (const auto& anchor : anchorList) {
+                    if (anchor.address < region.base
+                        || anchor.address >= region.base + region.size) continue;
+                    txt << "  " << anchor.what << " @ 0x" << std::hex
+                        << anchor.address << std::dec << '\n';
+                }
+
+                dumpedBases.insert(region.base);
+                ++stateSaved;
+                std::cout << "[+] state 转储 " << name.str() << ".bin" << std::endl;
+            };
+
+            for (const auto region : hitRegions) dumpOne(*region);
+
+            for (const auto& anchor : anchorList) {
+                if (stateSaved >= 40) break;
+                dumpOne(qualified[anchor.regionIndex]);
+            }
+
+            // 阶段 4: 闭包补采 -- 反复扫描已转储区域前 16MB 内的指针, 转储其
+            // 指向的未转储堆区域 (module dict -> 单例 -> lsw list -> 元素 dict),
+            // 直至覆盖 lsw 活数据或达 40 个总量上限
+            std::map<std::uintptr_t, std::vector<std::uint8_t>> closureData;
+
+            auto allByBase = all;
+            std::sort(allByBase.begin(), allByBase.end(),
+                [](const Region& left, const Region& right) {
+                    return left.base < right.base;
+                });
+
+            std::vector<const Region*> dumped;
+
+            for (const auto& region : allByBase) {
+                if (!dumpedBases.count(region.base)) continue;
+
+                closureData[region.base] = memory->ReadBytes(region.base,
+                    static_cast<std::size_t>(std::min<std::size_t>(
+                        region.size, 16u << 20)));
+                dumped.push_back(&region);
+            }
+
+            for (int round = 0; round < 6 && stateSaved < 40; ++round) {
+                std::unordered_map<std::uintptr_t, std::size_t> targetHits;
+
+                for (const auto region : dumped) {
+                    const auto it = closureData.find(region->base);
+                    if (it == closureData.end()) continue;
+                    const auto& data = it->second;
+
+                    for (std::size_t offset = 0; offset + 8 <= data.size(); offset += 8) {
+                        const auto value = U64At(data.data(), offset);
+                        if (value < 0x10000) continue;
+
+                        auto cand = std::upper_bound(allByBase.begin(), allByBase.end(),
+                            value, [](std::uintptr_t v, const Region& r) {
+                                return v < r.base;
+                            });
+                        if (cand == allByBase.begin()) continue;
+                        --cand;
+                        if (value >= cand->base + cand->size) continue;
+                        if (cand->size > (64ull << 20)) continue;
+                        if (dumpedBases.count(cand->base)) continue;
+
+                        ++targetHits[cand->base];
+                    }
+                }
+
+                std::vector<std::pair<std::size_t, std::uintptr_t>> ranked;
+                for (const auto& entry : targetHits)
+                    if (entry.second >= 8) ranked.push_back({ entry.second, entry.first });
+
+                std::sort(ranked.rbegin(), ranked.rend());
+
+                std::size_t added = 0;
+
+                for (const auto& entry : ranked) {
+                    if (stateSaved >= 40) break;
+
+                    auto cand = std::lower_bound(allByBase.begin(), allByBase.end(),
+                        entry.second, [](const Region& r, std::uintptr_t v) {
+                            return r.base < v;
+                        });
+                    if (cand == allByBase.end() || cand->base != entry.second) continue;
+
+                    dumpOne(*cand);
+                    dumped.push_back(&*cand);
+                    closureData[cand->base] = memory->ReadBytes(cand->base,
+                        static_cast<std::size_t>(std::min<std::size_t>(
+                            cand->size, 16u << 20)));
+                    ++added;
+                }
+
+                std::cout << "[*] 闭包第 " << (round + 1) << " 轮: 新增 "
+                    << added << " 个区域" << std::endl;
+
+                if (!added) break;
+            }
+
+            std::cout << "[*] 完成, 共 " << stateSaved << " 个区域 -> "
+                << outputRoot.string() << std::endl;
+        }
+        catch (const std::exception& exception) {
+            std::cerr << exception.what() << std::endl;
+
+            delete memory;
+
+            return 1;
+        }
+
+        delete memory;
+
+        return 0;
+    }
+
+    // --gwparse: 启发式定位 lsw 容器 -- 扫描 "ob_size==36 且 36 个元素类型一致
+    // 且类型为 combined dict" 的 PyListObject, 逐元素解析 dict 键名
+    // (str len@+16, data@+48) 与原始值, 落盘 gwparse_<list>.txt 供模板化
+    int RunGwParse(const Options& options) {
+        PMemory memory { };
+
+        try {
+            memory = new Memory::Memory();
+            memory->Attach(L"onmyoji.exe");
+        }
+        catch (const std::exception& exception) {
+            std::cerr << exception.what() << std::endl;
+
+            delete memory;
+
+            return 1;
+        }
+
+        try {
+            const auto all = CollectReadableRegions(memory);
+
+            // 阶段 1: dict 类型直方图 -- 两遍确认法:
+            //   (a) 弱过滤扫描: type@+8 必须落在模块镜像地址区间 (排除 0xffff..ff
+            //       哨兵/堆指针/栈指针), ma_used@+16 in [1,60]; 直方图 + 每类保留
+            //       前 8 个实例地址
+            //   (b) top 候选逐个确认: 指向处须是"类型对象" (其 ob_type@+8 也是
+            //       静态指针, 即 PyType_Type), 且抽样实例符合 dict 形状
+            //       (ma_keys@+32, 兼容 +24: dk_refcnt>0, dk_log2_size 合理,
+            //       dk_nentries>=ma_used)
+            std::cout << "[*] 第一遍: 统计 dict 类型指针 ..." << std::endl;
+
+            std::unordered_map<std::uintptr_t, std::size_t> typeHist;
+            std::unordered_map<std::uintptr_t, std::vector<std::uintptr_t>> typeSamples;
+
+            for (const auto& region : all) {
+                if (region.size > (64ull << 20)) continue;
+
+                const auto data = ReadRegion(memory, region);
+
+                for (std::size_t offset = 0; offset + 40 <= data.size(); offset += 8) {
+                    const auto type = U64At(data.data(), offset + 8);
+                    if (!PlausibleStatic(type)) continue;
+
+                    const auto used = U64At(data.data(), offset + 16);
+                    if (used < 1 || used > 60) continue;
+
+                    ++typeHist[type];
+
+                    if (typeSamples[type].size() < 8)
+                        typeSamples[type].push_back(region.base + offset);
+                }
+            }
+
+            std::vector<std::pair<std::uintptr_t, std::size_t>> candidates;
+            candidates.reserve(typeHist.size());
+
+            for (const auto& entry : typeHist)
+                candidates.emplace_back(entry.first, entry.second);
+
+            std::sort(candidates.begin(), candidates.end(),
+                [](const auto& a, const auto& b) { return a.second > b.second; });
+
+            // dict 实例形状确认 (ma_keys 指向 Python 堆上的 PyDictKeysObject,
+            // 只要求非零 + 可读 + 头部字段合理)
+            const auto isDictInstance = [&](const std::uintptr_t address) -> bool {
+                const auto head = memory->ReadBytes(address, 48);
+
+                return LooksLikeDict(memory, head);
+            };
+
+            std::uintptr_t dictType = 0;
+            std::size_t dictTypeCount = 0;
+
+            for (const auto& candidate : candidates) {
+                if (candidate.second < 500) break;
+
+                const auto tdata = memory->ReadBytes(candidate.first, 16);
+                if (tdata.size() < 16) continue;
+                if (!PlausibleStatic(U64At(tdata.data(), 8))) continue; // 类型对象的类型(PyType_Type)也是静态指针
+
+                std::size_t confirmed = 0;
+                const auto samples = typeSamples.find(candidate.first);
+                if (samples == typeSamples.end()) continue;
+
+                for (const auto address : samples->second)
+                    if (isDictInstance(address)) ++confirmed;
+
+                if (confirmed * 2 < samples->second.size()) continue; // >= 半数样本通过
+
+                dictType = candidate.first;
+                dictTypeCount = candidate.second;
+
+                break;
+            }
+
+            if (!dictType) {
+                std::cout << "[!] dict 类型指针识别失败, top 候选:" << std::endl;
+
+                for (std::size_t i = 0; i < candidates.size() && i < 10; ++i)
+                    std::cout << "    0x" << std::hex << candidates[i].first
+                        << std::dec << "  计数 " << candidates[i].second
+                        << std::endl;
+
+                delete memory;
+
+                return 1;
+            }
+
+            std::cout << "[*] PyDict_Type=0x" << std::hex << dictType << std::dec
+                << " (弱过滤计数 " << dictTypeCount << ", 抽样确认通过)"
+                << std::endl;
+
+            // 阶段 2: 定位 lsw 候选 -- 诊断式扫描:
+            //   对 ob_size in [8,64] 的容器位置同时尝试两种元素布局:
+            //     (a) list 间接数组: ob_item@+24 指向独立指针数组
+            //     (b) tuple 内联: 元素从 +24 起连续存放
+            //   分类统计 uniform-dict / near-miss (>=30 dict 其余 NULL) /
+            //   uniform-其它类型; 命中不拘泥恰好 36, 全部转储供离线分析
+            std::cout << "[*] 第二遍: 定位 dict 列表 (诊断模式) ..." << std::endl;
+
+            struct LswHit {
+                std::uintptr_t address;
+                std::vector<std::uintptr_t> elems;
+                std::size_t size;
+                bool indirect;
+            };
+
+            std::vector<LswHit> hits;
+            std::vector<LswHit> nearMissHits;
+            std::size_t scanned36 = 0;
+            std::map<std::size_t, std::size_t> dictListBySize;        // uniform dict 列表按 size
+            std::map<std::size_t, std::size_t> nearMissBySize;        // 36 slot 但部分 NULL
+            std::map<std::uintptr_t, std::size_t> otherUniformByType; // 非 dict 的 uniform 类型
+
+            // 指针数组/元素都在 Python 堆 (低位地址); 模块镜像指针不可能是元素
+            const auto plausibleElement = [&](const std::uintptr_t value) {
+                return value >= 0x10000 && value < kImageLo && (value & 7) == 0;
+            };
+
+            struct ElemStats {
+                std::size_t dictCount = 0;
+                std::size_t nullCount = 0;
+                std::size_t validCount = 0;
+                std::uintptr_t uniformType = 0; // uniform 且全为非空时为公共类型
+                bool uniform = false;
+                bool uniformDict = false;
+            };
+
+            // 逐元素读头 (仅对通过本地过滤的元素), 统计 dict 占比与类型一致性
+            const auto analyze = [&](const std::vector<std::uintptr_t>& elements) {
+                ElemStats stats;
+                std::uintptr_t firstType = 0;
+                stats.uniform = true;
+
+                for (const auto element : elements) {
+                    const auto head = memory->ReadBytes(element, 16);
+                    if (head.size() < 16) { stats.uniform = false; continue; }
+
+                    ++stats.validCount;
+
+                    const auto type = U64At(head.data(), 8);
+                    if (type == dictType) ++stats.dictCount;
+
+                    if (!firstType) firstType = type;
+                    else if (type != firstType) stats.uniform = false;
+                }
+
+                stats.uniformType = stats.uniform ? firstType : 0;
+                stats.uniformDict = stats.uniform && firstType == dictType;
+
+                return stats;
+            };
+
+            for (const auto& region : all) {
+                if (region.size > (256ull << 20)) continue;
+
+                const auto data = ReadRegion(memory, region);
+
+                for (std::size_t offset = 0; offset + 32 <= data.size(); offset += 8) {
+                    const auto size = U64At(data.data(), offset + 16);
+                    if (size < 8 || size > 64) continue;
+
+                    if (size == 36) ++scanned36;
+
+                    const auto bytes = size * 8;
+
+                    // (a) list 间接数组: ob_item 指向独立分配的指针数组
+                    const auto items = U64At(data.data(), offset + 24);
+                    if (items >= 0x10000 && items < kImageLo) {
+                        const auto arr = memory->ReadBytes(items, bytes);
+
+                        if (arr.size() == bytes) {
+                            std::vector<std::uintptr_t> candidates;
+                            std::size_t nullCount = 0;
+
+                            for (std::size_t index = 0; index < size; ++index) {
+                                const auto element = U64At(arr.data(), index * 8);
+                                if (element == 0) { ++nullCount; continue; }
+                                if (plausibleElement(element))
+                                    candidates.push_back(element);
+                            }
+
+                            // 要求绝大多数槽位有效, 挡住把普通数据当元素的噪声
+                            if (candidates.size() >= size - size / 4
+                                && candidates.size() >= 8) {
+                                const auto stats = analyze(candidates);
+
+                                if (stats.uniformDict && nullCount == 0
+                                    && stats.validCount == size) {
+                                    ++dictListBySize[size];
+
+                                    if (hits.size() < 16) {
+                                        hits.push_back({ region.base + offset,
+                                            std::move(candidates), size, true });
+
+                                        std::cout << "[+] uniform dict 列表 @0x"
+                                            << std::hex << region.base + offset
+                                            << std::dec << " size=" << size
+                                            << " (list)" << std::endl;
+                                    }
+                                }
+                                else if (size == 36 && stats.dictCount >= 30
+                                    && stats.dictCount == stats.validCount
+                                    && nullCount >= 1) {
+                                    ++nearMissBySize[36];
+
+                                    if (nearMissHits.size() < 8) {
+                                        nearMissHits.push_back({ region.base + offset,
+                                            std::move(candidates), size, true });
+                                    }
+                                }
+                                else if (stats.uniform
+                                    && stats.uniformType != dictType) {
+                                    ++otherUniformByType[stats.uniformType];
+                                }
+                            }
+                        }
+                    }
+
+                    // (b) tuple 内联: 元素从 +24 起连续存放
+                    if (offset + 24 + bytes <= data.size()) {
+                        std::vector<std::uintptr_t> candidates;
+                        std::size_t nullCount = 0;
+
+                        for (std::size_t index = 0; index < size; ++index) {
+                            const auto element = U64At(data.data(),
+                                offset + 24 + index * 8);
+                            if (element == 0) { ++nullCount; continue; }
+                            if (plausibleElement(element))
+                                candidates.push_back(element);
+                        }
+
+                        if (candidates.size() >= size - size / 4
+                            && candidates.size() >= 8) {
+                            const auto stats = analyze(candidates);
+
+                            if (stats.uniformDict && nullCount == 0
+                                && stats.validCount == size) {
+                                ++dictListBySize[size];
+
+                                if (hits.size() < 16) {
+                                    hits.push_back({ region.base + offset,
+                                        std::move(candidates), size, false });
+
+                                    std::cout << "[+] uniform dict 列表 @0x"
+                                        << std::hex << region.base + offset
+                                        << std::dec << " size=" << size
+                                        << " (tuple)" << std::endl;
+                                }
+                            }
+                            else if (size == 36 && stats.dictCount >= 30
+                                && stats.dictCount == stats.validCount
+                                && nullCount >= 1) {
+                                ++nearMissBySize[36];
+
+                                if (nearMissHits.size() < 8) {
+                                    nearMissHits.push_back({ region.base + offset,
+                                        std::move(candidates), size, false });
+                                }
+                            }
+                            else if (stats.uniform
+                                && stats.uniformType != dictType) {
+                                ++otherUniformByType[stats.uniformType];
+                            }
+                        }
+                    }
+                }
+            }
+
+            // 诊断汇总
+            std::cout << "[*] 诊断: ob_size∈[8,64] 扫描完成, size=36 位置 "
+                << scanned36 << " 个" << std::endl;
+
+            for (const auto& entry : dictListBySize)
+                std::cout << "    uniform dict 列表 size=" << entry.first
+                    << " x" << entry.second << std::endl;
+
+            for (const auto& entry : nearMissBySize)
+                std::cout << "    near-miss (36 slot 部分 NULL, >=30 dict) x"
+                    << entry.second << std::endl;
+
+            for (const auto& entry : otherUniformByType)
+                std::cout << "    uniform 其它类型 0x" << std::hex << entry.first
+                    << std::dec << " x" << entry.second << std::endl;
+
+            if (hits.empty() && nearMissHits.empty()) {
+                std::cout << "[!] 未发现任何 uniform dict 列表 -- 两种可能:" << std::endl;
+                std::cout << "    1. 时机问题: lsw 仅在回合内存活, 请在 36 只式神"
+                    "正在屏幕上行走的瞬间运行 (押注/结算界面可能已清空)" << std::endl;
+                std::cout << "    2. 结构问题: lsw 容器形态超出当前假设,"
+                    "如再失败请把本次输出完整反馈" << std::endl;
+
+                delete memory;
+
+                return 1;
+            }
+
+            if (hits.empty() && !nearMissHits.empty()) {
+                // 无严格命中但有 near-miss: 转储 near-miss 供离线分析
+                std::cout << "[*] 无严格 uniform 命中, 转储 "
+                    << nearMissHits.size() << " 个 near-miss 候选" << std::endl;
+
+                for (const auto& candidate : nearMissHits)
+                    hits.push_back(candidate);
+            }
+
+            // 阶段 3: 逐元素解析 dict (键名 + 原始值) -> gwparse_<list>.txt
+            const auto outputRoot = std::filesystem::path("yys_walklist_dump");
+            std::filesystem::create_directories(outputRoot);
+
+            for (std::size_t index = 0; index < hits.size(); ++index) {
+                const auto& hit = hits[index];
+
+                std::ostringstream name { };
+                name << "gwparse_" << index << '_'
+                    << std::hex << std::setw(12) << std::setfill('0')
+                    << hit.address << std::dec;
+
+                std::ofstream txt(outputRoot / (name.str() + ".txt"), std::ios::trunc);
+                txt << "list=0x" << std::hex << hit.address << std::dec
+                    << " size=" << hit.size
+                    << " layout=" << (hit.indirect ? "list-indirect" : "tuple-inline")
+                    << " elements=" << hit.elems.size() << "\n\n";
+
+                for (std::size_t e = 0; e < hit.elems.size(); ++e)
+                    DumpDictEntries(memory, txt, hit.elems[e],
+                        "元素#" + std::to_string(e));
+            }
+
+            std::cout << "[*] 完成, " << hits.size()
+                << " 个列表 -> yys_walklist_dump\\gwparse_*.txt" << std::endl;
+        }
+        catch (const std::exception& exception) {
+            std::cerr << exception.what() << std::endl;
+
+            delete memory;
+
+            return 1;
+        }
+
+        delete memory;
+
+        return 0;
+    }
+
+    // --gwfind: 定向查找 lsw/walkList/ls 等键名 str 对象, 反查 dict entries
+    // 中 me_key 指向它们的槽位, 直接转储值容器 (dict/list), 不依赖容器元素
+    // 均匀性; 值为 None/静态对象时打印提示 (区分"时机问题"与"结构问题")
+    int RunGwFind(const Options& options) {
+        (void)options;
+        PMemory memory { };
+
+        try {
+            memory = new Memory::Memory();
+            memory->Attach(L"onmyoji.exe");
+        }
+        catch (const std::exception& exception) {
+            std::cerr << exception.what() << std::endl;
+
+            delete memory;
+
+            return 1;
+        }
+
+        try {
+            // 目标键名: 状态同步键元组 (报告 2.3) + lsw
+            const char* const targetNames[] = {
+                "lsw", "walkList", "ls",
+                "beans", "effect", "otherplayer",
+                "ex_params", "israteup",
+            };
+            constexpr std::size_t kNameCount =
+                sizeof(targetNames) / sizeof(targetNames[0]);
+
+            const auto all = CollectReadableRegions(memory);
+
+            // 阶段 A: 找键名 str 对象候选
+            // (len@+16 == 名长 && data@+48 == 名 && NUL && refcnt>0 && type 静态)
+            std::vector<std::vector<std::uintptr_t>> strCandidates(kNameCount);
+
+            for (const auto& region : all) {
+                if (region.size > (256ull << 20)) continue;
+
+                const auto data = ReadRegion(memory, region);
+
+                for (std::size_t offset = 0; offset + 64 <= data.size();
+                    offset += 8) {
+                    const auto length = U64At(data.data(), offset + 16);
+                    if (length < 1 || length > 12) continue;
+
+                    for (std::size_t n = 0; n < kNameCount; ++n) {
+                        const auto* const name = targetNames[n];
+                        const auto nameLen = std::strlen(name);
+                        if (length != nameLen) continue;
+                        if (nameLen + 48 > data.size() - offset) continue;
+
+                        if (std::memcmp(data.data() + offset + 48, name,
+                            nameLen) != 0) continue;
+                        if (data[offset + 48 + nameLen] != 0) continue;
+
+                        if (U64At(data.data(), offset) == 0) continue;
+                        if (!PlausibleStatic(U64At(data.data(), offset + 8)))
+                            continue;
+
+                        auto& bucket = strCandidates[n];
+                        const auto address = region.base + offset;
+
+                        if (bucket.size() < 32 && std::find(bucket.begin(),
+                            bucket.end(), address) == bucket.end())
+                            bucket.push_back(address);
+                    }
+                }
+            }
+
+            std::size_t totalStrs = 0;
+
+            for (std::size_t n = 0; n < kNameCount; ++n) {
+                totalStrs += strCandidates[n].size();
+                std::cout << "[*] 键名 \"" << targetNames[n] << "\" str 候选 "
+                    << strCandidates[n].size() << " 个" << std::endl;
+            }
+
+            if (totalStrs == 0) {
+                std::cout << "[!] 未找到任何键名 str 对象 -- str 布局假设不符,"
+                    " 请反馈完整输出" << std::endl;
+
+                delete memory;
+
+                return 1;
+            }
+
+            std::unordered_map<std::uintptr_t, std::size_t> strOwner;
+
+            for (std::size_t n = 0; n < kNameCount; ++n)
+                for (const auto address : strCandidates[n])
+                    strOwner[address] = n;
+
+            // 阶段 B: 全堆引用扫描 (dict entry 的 me_key 槽位指向键名 str)
+            std::unordered_set<std::uintptr_t> dumpedValues;
+            std::map<std::string, std::size_t> valueStats;
+            std::map<std::string, std::size_t> noneStats;
+            std::size_t dumpCount = 0;
+
+            const auto outputRoot = std::filesystem::path("yys_walklist_dump");
+            std::filesystem::create_directories(outputRoot);
+
+            for (const auto& region : all) {
+                if (region.size > (256ull << 20)) continue;
+                if (dumpCount >= 24) break;
+
+                const auto data = ReadRegion(memory, region);
+
+                for (std::size_t offset = 0; offset + 24 <= data.size();
+                    offset += 8) {
+                    if (dumpCount >= 24) break;
+
+                    const auto qword = U64At(data.data(), offset);
+                    const auto owner = strOwner.find(qword);
+                    if (owner == strOwner.end()) continue;
+
+                    const auto* const name = targetNames[owner->second];
+
+                    // me_key 槽位: 16B 布局 value@+8; 24B 布局 value@+16
+                    for (const auto delta : { std::size_t { 8 }, std::size_t { 16 } }) {
+                        if (offset + delta + 8 > data.size()) continue;
+
+                        const auto value = U64At(data.data(), offset + delta);
+                        if (value < 0x10000) {
+                            if (value == 0) ++noneStats[name];
+                            continue;
+                        }
+
+                        if (!dumpedValues.insert(value).second) continue;
+
+                        const auto head = memory->ReadBytes(value, 64);
+                        if (head.size() < 64) continue;
+
+                        const auto used = U64At(head.data(), 16);
+                        const auto items = U64At(head.data(), 24);
+
+                        const bool dictShaped = LooksLikeDict(memory, head);
+                        const bool listShaped = !dictShaped && used >= 1
+                            && used <= 64 && items >= 0x10000
+                            && items < kImageLo;
+
+                        if (dictShaped) {
+                            std::ostringstream fileName { };
+                            fileName << "gwfind_" << name << "_d" << dumpCount
+                                << '_' << std::hex << value << std::dec;
+
+                            std::ofstream txt(outputRoot / (fileName.str()
+                                + ".txt"), std::ios::trunc);
+                            txt << "key=\"" << name << "\" dict=0x" << std::hex
+                                << value << std::dec << "\n\n";
+
+                            DumpDictEntries(memory, txt, value, "dict");
+
+                            ++dumpCount;
+                            ++valueStats[name];
+                            std::cout << "[+] \"" << name << "\" -> dict @0x"
+                                << std::hex << value << std::dec << std::endl;
+                        }
+                        else if (listShaped) {
+                            const auto arr = memory->ReadBytes(items, used * 8);
+                            if (arr.size() < used * 8) continue;
+
+                            std::ostringstream fileName { };
+                            fileName << "gwfind_" << name << "_l" << dumpCount
+                                << '_' << std::hex << value << std::dec;
+
+                            std::ofstream txt(outputRoot / (fileName.str()
+                                + ".txt"), std::ios::trunc);
+                            txt << "key=\"" << name << "\" list=0x" << std::hex
+                                << value << std::dec << " size=" << used
+                                << "\n\n";
+
+                            std::size_t dictElems = 0;
+
+                            for (std::size_t index = 0; index < used; ++index) {
+                                const auto element = U64At(arr.data(), index * 8);
+                                if (element < 0x10000) continue;
+
+                                const auto ehead = memory->ReadBytes(element, 64);
+                                if (ehead.size() < 64) continue;
+
+                                if (LooksLikeDict(memory, ehead)) {
+                                    ++dictElems;
+
+                                    DumpDictEntries(memory, txt, element,
+                                        "元素#" + std::to_string(index));
+                                }
+                                else {
+                                    txt << "-- 元素#" << index << " = "
+                                        << DescribeValue(memory, element)
+                                        << "\n";
+                                }
+                            }
+
+                            ++dumpCount;
+                            ++valueStats[name];
+                            std::cout << "[+] \"" << name << "\" -> list @0x"
+                                << std::hex << value << std::dec << " size="
+                                << used << " (dict 元素 " << dictElems << ")"
+                                << std::endl;
+                        }
+                        else {
+                            // 非 dict/list: 直接解释值内容 (None/常量/int/str...)
+                            std::cout << "[i] \"" << name << "\" -> "
+                                << DescribeValue(memory, value) << " @0x"
+                                << std::hex << value << std::dec << std::endl;
+                            ++noneStats[name];
+                        }
+                    }
+                }
+            }
+
+            std::cout << "[*] 完成, " << dumpCount
+                << " 个值容器 -> yys_walklist_dump\\gwfind_*.txt" << std::endl;
+
+            for (const auto& entry : valueStats)
+                std::cout << "    \"" << entry.first << "\" 转储 "
+                    << entry.second << " 个" << std::endl;
+
+            for (const auto& entry : noneStats)
+                std::cout << "    \"" << entry.first << "\" 非容器值 "
+                    << entry.second << " 个" << std::endl;
+
+            if (dumpCount == 0) {
+                std::cout << "[!] 键引用的值均为 None/常量/不可解析 --"
+                    " 若 lsw 亦如此, 说明当前时刻 lsw 已被清空 (回合未开始或"
+                    "已结束), 请用 --gwwatch 盯槽等待回合填充" << std::endl;
+            }
+        }
+        catch (const std::exception& exception) {
+            std::cerr << exception.what() << std::endl;
+
+            delete memory;
+
+            return 1;
+        }
+
+        delete memory;
+
+        return 0;
+    }
+
+    // --gwwatch: 锁定 lsw/walkList 的 dict entry 值槽位后低频轮询,
+    // 列表 size 达到阈值 (>=30) 且内容指针为新时自动转储全部元素 --
+    // 解决 lsw 仅在回合内存活、手动单次扫描抓不住时机的问题
+    int RunGwWatch(const Options& options) {
+        PMemory memory { };
+
+        try {
+            memory = new Memory::Memory();
+            memory->Attach(L"onmyoji.exe");
+        }
+        catch (const std::exception& exception) {
+            std::cerr << exception.what() << std::endl;
+
+            delete memory;
+
+            return 1;
+        }
+
+        try {
+            const char* const targetNames[] = { "lsw", "walkList" };
+            constexpr std::size_t kNameCount =
+                sizeof(targetNames) / sizeof(targetNames[0]);
+
+            const auto all = CollectReadableRegions(memory);
+
+            // 阶段 A: 键名 str 候选 (与 --gwfind 相同判据)
+            std::vector<std::vector<std::uintptr_t>> strCandidates(kNameCount);
+
+            for (const auto& region : all) {
+                if (region.size > (256ull << 20)) continue;
+
+                const auto data = ReadRegion(memory, region);
+
+                for (std::size_t offset = 0; offset + 64 <= data.size();
+                    offset += 8) {
+                    const auto length = U64At(data.data(), offset + 16);
+                    if (length < 1 || length > 12) continue;
+
+                    for (std::size_t n = 0; n < kNameCount; ++n) {
+                        const auto* const name = targetNames[n];
+                        const auto nameLen = std::strlen(name);
+                        if (length != nameLen) continue;
+                        if (nameLen + 48 > data.size() - offset) continue;
+
+                        if (std::memcmp(data.data() + offset + 48, name,
+                            nameLen) != 0) continue;
+                        if (data[offset + 48 + nameLen] != 0) continue;
+
+                        if (U64At(data.data(), offset) == 0) continue;
+                        if (!PlausibleStatic(U64At(data.data(), offset + 8)))
+                            continue;
+
+                        auto& bucket = strCandidates[n];
+                        const auto address = region.base + offset;
+
+                        if (bucket.size() < 32 && std::find(bucket.begin(),
+                            bucket.end(), address) == bucket.end())
+                            bucket.push_back(address);
+                    }
+                }
+            }
+
+            std::unordered_map<std::uintptr_t, std::size_t> strOwner;
+
+            for (std::size_t n = 0; n < kNameCount; ++n) {
+                std::cout << "[*] 键名 \"" << targetNames[n] << "\" str 候选 "
+                    << strCandidates[n].size() << " 个" << std::endl;
+
+                for (const auto address : strCandidates[n])
+                    strOwner[address] = n;
+            }
+
+            if (strOwner.empty()) {
+                std::cout << "[!] 未找到 lsw/walkList 键名 str 对象"
+                    << std::endl;
+
+                delete memory;
+
+                return 1;
+            }
+
+            // 阶段 B: 引用扫描 -> 值槽位地址 (me_key 槽位 +8/+16 两处都盯)
+            std::vector<std::uintptr_t> slots;
+            std::unordered_map<std::uintptr_t, std::size_t> slotName;
+
+            for (const auto& region : all) {
+                if (region.size > (256ull << 20)) continue;
+
+                const auto data = ReadRegion(memory, region);
+
+                for (std::size_t offset = 0; offset + 24 <= data.size();
+                    offset += 8) {
+                    const auto owner = strOwner.find(U64At(data.data(), offset));
+                    if (owner == strOwner.end()) continue;
+
+                    for (const auto delta :
+                        { std::size_t { 8 }, std::size_t { 16 } }) {
+                        if (offset + delta + 8 > data.size()) continue;
+
+                        const auto slot = region.base + offset + delta;
+
+                        if (!slotName.count(slot)) {
+                            slots.push_back(slot);
+                            slotName[slot] = owner->second;
+                        }
+                    }
+                }
+            }
+
+            std::cout << "[*] 锁定 " << slots.size() << " 个值槽位, 开始轮询"
+                << " (Ctrl+C 退出, --interval=ms 调整频率"
+                << (options.freezeOnHit ? ", 命中即冻结" : "") << ")"
+                << std::endl;
+            std::cout << "[*] 请进入百鬼夜行; lsw size 达到 >=8 时自动转储"
+                << std::endl;
+
+            // 轮询状态: 按 list 对象地址记录 (size, ob_item)
+            struct ListState {
+                std::uint64_t size;
+                std::uint64_t items;
+            };
+
+            std::unordered_map<std::uintptr_t, ListState> known;
+            std::size_t dumpCount = 0;
+
+            const auto outputRoot = std::filesystem::path("yys_walklist_dump");
+            std::filesystem::create_directories(outputRoot);
+
+            while (true) {
+                for (std::size_t s = 0; s < slots.size(); ++s) {
+                    const auto vbuf = memory->ReadBytes(slots[s], 8);
+                    if (vbuf.size() < 8) continue;
+
+                    const auto value = U64At(vbuf.data(), 0);
+                    if (value < 0x10000) continue;
+
+                    const auto head = memory->ReadBytes(value, 32);
+                    if (head.size() < 32) continue;
+
+                    const auto used = U64At(head.data(), 16);
+                    const auto items = U64At(head.data(), 24);
+
+                    if (used < 1 || used > 64 || items < 0x10000
+                        || items >= kImageLo) continue;
+
+                    const auto it = known.find(value);
+                    if (it != known.end() && it->second.size == used
+                        && it->second.items == items) continue;
+
+                    const bool wasKnown = it != known.end();
+                    const auto prevSize = wasKnown ? it->second.size : 0;
+                    const auto prevItems = wasKnown ? it->second.items : 0;
+
+                    known[value] = { used, items };
+
+                    const auto* const name = targetNames[slotName[slots[s]]];
+
+                    std::cout << "[t] \"" << name << "\" list @0x" << std::hex
+                        << value << std::dec << " size=" << used << std::endl;
+
+                    if (used < 8 || dumpCount >= 8) continue;
+                    if (wasKnown && prevSize >= 8 && prevItems == items)
+                        continue; // 同一内容批次已转储过
+
+                    // 命中: 可选冻结进程 -> 转储 -> 恢复
+                    bool frozen = false;
+
+                    if (options.freezeOnHit) {
+                        if (NtSuspendProcessHandle(memory->Handle()) == 0) {
+                            frozen = true;
+                            std::cout << "[*] 进程已冻结, 开始转储..."
+                                << std::endl;
+                        }
+                        else {
+                            std::cout << "[!] NtSuspendProcess 失败,"
+                                " 不冻结继续转储" << std::endl;
+                        }
+                    }
+
+                    // size 进入 >=8 且内容指针为新 -> 转储
+                    std::ostringstream fileName { };
+                    fileName << "gwfind_" << name << "_live" << dumpCount
+                        << '_' << std::hex << value << std::dec;
+
+                    std::ofstream txt(outputRoot / (fileName.str() + ".txt"),
+                        std::ios::trunc);
+                    txt << "key=\"" << name << "\" list=0x" << std::hex
+                        << value << std::dec << " size=" << used << "\n\n";
+
+                    const auto arr = memory->ReadBytes(items, used * 8);
+                    std::size_t dictElems = 0;
+
+                    if (arr.size() >= used * 8) {
+                        for (std::size_t index = 0; index < used; ++index) {
+                            const auto element = U64At(arr.data(), index * 8);
+                            if (element < 0x10000) continue;
+
+                            const auto ehead = memory->ReadBytes(element, 64);
+                            if (ehead.size() < 64) continue;
+
+                            if (LooksLikeDict(memory, ehead)) {
+                                ++dictElems;
+
+                                DumpDictEntries(memory, txt, element,
+                                    "元素#" + std::to_string(index));
+                            }
+                            else {
+                                txt << "-- 元素#" << index << " = "
+                                    << DescribeValue(memory, element) << "\n";
+                            }
+                        }
+                    }
+
+                    ++dumpCount;
+                    std::cout << "[+] \"" << name << "\" 已填充 (size=" << used
+                        << ", dict 元素 " << dictElems << ") -> "
+                        << fileName.str() << ".txt" << std::endl;
+
+                    if (frozen) {
+                        NtResumeProcessHandle(memory->Handle());
+                        std::cout << "[*] 进程已恢复" << std::endl;
+                    }
+                }
+
+                Sleep(static_cast<DWORD>(options.intervalMs));
+            }
+        }
+        catch (const std::exception& exception) {
+            std::cerr << exception.what() << std::endl;
+
+            delete memory;
+
+            return 1;
+        }
+
+        delete memory;
+
+        return 0; // 不可达 (Ctrl+C 终止进程), 仅满足编译器
+    }
+
+    // --gwtype: 按类名定位 Python heap type 对象 (tp_name C 串验证 +
+    // Py_TPFLAGS_HEAPTYPE), 再扫 ob_type==该类 的实例, 转储实例 __dict__
+    // (标准布局) 或原始指针注解 (managed dict 布局) -- 直接拿成员对象的
+    // 字段名 (pos/speed/heroId), 不依赖 lsw 容器
+    int RunGwType(const Options& options) {
+        (void)options;
+        PMemory memory { };
+
+        try {
+            memory = new Memory::Memory();
+            memory->Attach(L"onmyoji.exe");
+        }
+        catch (const std::exception& exception) {
+            std::cerr << exception.what() << std::endl;
+
+            delete memory;
+
+            return 1;
+        }
+
+        try {
+            const char* const classNames[] = {
+                "BaiGuiYeXingMember", "GhostWalkSingleton",
+                "GhostWalkScene", "GWG3dTeamLogic",
+            };
+            constexpr std::size_t kClassCount =
+                sizeof(classNames) / sizeof(classNames[0]);
+
+            constexpr auto kHeapTypeFlag = 0x200ull; // Py_TPFLAGS_HEAPTYPE
+            constexpr std::size_t kTPOffFlags = 168; // PyTypeObject.tp_flags
+            constexpr std::size_t kTPOffName = 24;   // PyTypeObject.tp_name (char*)
+
+            const auto all = CollectReadableRegions(memory);
+
+            // 阶段 1: 类名 str 对象候选 (len <= 40)
+            std::vector<std::vector<std::uintptr_t>> nameCandidates(kClassCount);
+
+            for (const auto& region : all) {
+                if (region.size > (256ull << 20)) continue;
+
+                const auto data = ReadRegion(memory, region);
+
+                for (std::size_t offset = 0; offset + 112 <= data.size();
+                    offset += 8) {
+                    const auto length = U64At(data.data(), offset + 16);
+                    if (length < 1 || length > 40) continue;
+
+                    for (std::size_t n = 0; n < kClassCount; ++n) {
+                        const auto* const name = classNames[n];
+                        const auto nameLen = std::strlen(name);
+                        if (length != nameLen) continue;
+                        if (nameLen + 48 > data.size() - offset) continue;
+
+                        if (std::memcmp(data.data() + offset + 48, name,
+                            nameLen) != 0) continue;
+                        if (data[offset + 48 + nameLen] != 0) continue;
+
+                        if (U64At(data.data(), offset) == 0) continue;
+                        if (!PlausibleStatic(U64At(data.data(), offset + 8)))
+                            continue;
+
+                        auto& bucket = nameCandidates[n];
+                        const auto address = region.base + offset;
+
+                        if (bucket.size() < 16 && std::find(bucket.begin(),
+                            bucket.end(), address) == bucket.end())
+                            bucket.push_back(address);
+                    }
+                }
+            }
+
+            // 阶段 2: 类名引用 -> 回溯对象头 -> 类型对象验证
+            // (tp_name 指向的 C 串 == 类名 && flags HEAPTYPE && ob_type 静态)
+            std::vector<std::uintptr_t> typeObjects;
+            std::unordered_map<std::uintptr_t, std::size_t> typeClass;
+
+            for (std::size_t n = 0; n < kClassCount; ++n) {
+                const auto* const name = classNames[n];
+                const auto nameLen = std::strlen(name);
+
+                std::unordered_set<std::uintptr_t> refs;
+
+                for (const auto& region : all) {
+                    if (region.size > (256ull << 20)) continue;
+
+                    const auto data = ReadRegion(memory, region);
+
+                    for (std::size_t offset = 0; offset + 8 <= data.size();
+                        offset += 8) {
+                        for (const auto candidate : nameCandidates[n]) {
+                            if (U64At(data.data(), offset) == candidate) {
+                                refs.insert(region.base + offset);
+                                break;
+                            }
+                        }
+                    }
+                }
+
+                for (const auto ref : refs) {
+                    // 回溯最多 0x300 字节找对象头
+                    for (std::size_t back = 8; back <= 0x300; back += 8) {
+                        if (ref < back) break;
+
+                        const auto base = ref - back;
+                        bool valid = false;
+                        std::uint64_t tpNamePtr = 0;
+
+                        // 读取对象头 (跨区域读, back 落在其它区域时失败)
+                        const auto head = memory->ReadBytes(base, 192);
+                        if (head.size() < 192) continue;
+
+                        if (U64At(head.data(), 0) == 0) continue;
+                        if (!PlausibleStatic(U64At(head.data(), 8))) continue;
+
+                        tpNamePtr = U64At(head.data(), kTPOffName);
+                        if (tpNamePtr < 0x10000) continue;
+
+                        const auto nameData = memory->ReadBytes(tpNamePtr,
+                            nameLen + 2);
+                        if (nameData.size() < nameLen + 1) continue;
+                        if (std::memcmp(nameData.data(), name, nameLen) != 0)
+                            continue;
+                        if (nameData[nameLen] != 0) continue;
+
+                        if (!(U64At(head.data(), kTPOffFlags) & kHeapTypeFlag))
+                            continue;
+
+                        valid = true;
+
+                        if (valid && !typeClass.count(base)) {
+                            typeObjects.push_back(base);
+                            typeClass[base] = n;
+
+                            std::cout << "[+] 类 " << name << " 类型对象 @0x"
+                                << std::hex << base << std::dec << std::endl;
+                        }
+
+                        break;
+                    }
+                }
+            }
+
+            if (typeObjects.empty()) {
+                std::cout << "[!] 未定位到任何类类型对象 -- 回溯/验证假设不符,"
+                    " 请反馈完整输出" << std::endl;
+
+                delete memory;
+
+                return 1;
+            }
+
+            // 阶段 3: 实例扫描 (ob_type == 类型对象) -> 转储 __dict__/原始注解
+            const auto outputRoot = std::filesystem::path("yys_walklist_dump");
+            std::filesystem::create_directories(outputRoot);
+
+            for (const auto typeObj : typeObjects) {
+                const auto* const name = classNames[typeClass[typeObj]];
+                std::size_t instanceCount = 0;
+                std::size_t fileCount = 0;
+
+                for (const auto& region : all) {
+                    if (region.size > (256ull << 20)) continue;
+                    if (fileCount >= 40) break;
+
+                    const auto data = ReadRegion(memory, region);
+
+                    for (std::size_t offset = 8; offset + 128 <= data.size();
+                        offset += 8) {
+                        if (fileCount >= 40) break;
+                        if (U64At(data.data(), offset) != typeObj) continue;
+
+                        // 对象头在 offset-8: refcnt@-8, type@0, __dict__@+8...
+                        const auto base = region.base + offset - 8;
+                        if (U64At(data.data(), offset - 8) == 0) continue;
+
+                        const auto ihead = memory->ReadBytes(base, 128);
+                        if (ihead.size() < 128) continue;
+
+                        ++instanceCount;
+                        if (fileCount >= 40) continue;
+
+                        std::ostringstream fileName { };
+                        fileName << "gwtype_" << name << "_" << fileCount
+                            << '_' << std::hex << base << std::dec;
+
+                        std::ofstream txt(outputRoot / (fileName.str()
+                            + ".txt"), std::ios::trunc);
+                        txt << "class=" << name << " instance=0x" << std::hex
+                            << base << std::dec << " refcnt="
+                            << U64At(ihead.data(), 0) << "\n";
+
+                        const auto attrPtr = U64At(ihead.data(), 16);
+                        const auto ahead = memory->ReadBytes(attrPtr, 64);
+
+                        if (attrPtr >= 0x10000 && ahead.size() >= 64
+                            && LooksLikeDict(memory, ahead)) {
+                            // 标准布局: [+16] 为实例 __dict__
+                            DumpDictEntries(memory, txt, attrPtr, "__dict__");
+                        }
+                        else {
+                            // managed dict / 非标准布局: 原始指针注解
+                            txt << "[+16] 非标准 dict (0x" << std::hex
+                                << attrPtr << std::dec
+                                << "), 原始指针注解:\n";
+
+                            for (std::size_t off = 16; off + 8 <= 128;
+                                off += 8) {
+                                const auto qword = U64At(ihead.data(), off);
+                                if (qword < 0x10000) continue;
+
+                                txt << "   [+ " << off << "] 0x" << std::hex
+                                    << qword << std::dec << " = "
+                                    << DescribeValue(memory, qword) << "\n";
+                            }
+                        }
+
+                        ++fileCount;
+                    }
+                }
+
+                std::cout << "[*] 类 " << name << ": 实例 " << instanceCount
+                    << " 个, 转储 " << fileCount << " 份" << std::endl;
+            }
+
+            std::cout << "[*] 完成 -> yys_walklist_dump\\gwtype_*.txt"
+                << std::endl;
         }
         catch (const std::exception& exception) {
             std::cerr << exception.what() << std::endl;

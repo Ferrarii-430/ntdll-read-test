@@ -69,7 +69,16 @@ namespace Memory {
 
         void Attach(const std::wstring& name);
 
+        // 进程句柄 (NtSuspendProcess/NtResumeProcess 等扩展 API 用)
+        [[nodiscard]] HANDLE Handle() const { return _handle; }
+
         [[nodiscard]] bool ReadRaw(
+            const std::uintptr_t address, void* buffer, const std::size_t size
+        ) const;
+
+        // 容错读取: 返回实际读取的字节数 (>=0); 跨保留页的部分拷贝
+        // (STATUS_PARTIAL_COPY) 也算成功, 缓冲区前 got 字节有效
+        [[nodiscard]] std::size_t ReadPartial(
             const std::uintptr_t address, void* buffer, const std::size_t size
         ) const;
 

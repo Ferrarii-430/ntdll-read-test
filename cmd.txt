@@ -15,5 +15,6 @@ cd D:\CppProduct\ntdll-usermode-ram-read-write\Build
 .\ntdll-usermode-ram-read-write.exe --gwlist --rediscover
 
 .\ntdll-usermode-ram-read-write.exe --ghostwalk --pool=384,593,514,515,516,518,520,419,405,407,404,406,611
+
 REM v2 跟踪器 (2026-11-24): 位置法轨迹跟踪+常数黑名单+停帧治理, CSV 新增 entity_index,y,group_rows,track_y_range,dt_s 列
 .\ntdll-usermode-ram-read-write.exe --ghostwalk --interval=800 --csv=ghostwalk_v2.csv
