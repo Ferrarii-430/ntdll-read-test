@@ -887,14 +887,22 @@ namespace GhostWalk {
 
             // D 通道区域: 标识区域 (Python 对象); F 通道区域: 全部可写区域 (引擎实体)
             // 引擎实体坐标不在标识区域内, F 通道必须覆盖全部可写内存
+            // 注意: 单区域上限 256MB (大堆段内的实体结构曾因此整段漏扫),
+            // 且区域列表每 10 帧动态刷新 (回合开始时新分配的区域自动纳入)
             const auto& tickRegions = qualified;
 
             std::vector<Region> f32Regions;
-            {
+            std::size_t f32Total = 0;
+            bool refreshQuiet = false;
+            auto refreshF32Regions = [&]() {
                 constexpr DWORD kWritable = PAGE_READWRITE | PAGE_WRITECOPY
                     | PAGE_EXECUTE_READWRITE | PAGE_EXECUTE_WRITECOPY;
 
-                std::size_t f32Total = 0;
+                std::unordered_set<std::uintptr_t> known;
+                for (const auto& region : f32Regions) known.insert(region.base);
+
+                std::size_t added = 0;
+                f32Total = 0;
                 for (const auto& info : memory->GetRegions()) {
                     if (info.State != MEM_COMMIT) continue;
                     if (info.Type != MEM_PRIVATE && info.Type != MEM_MAPPED) continue;
@@ -902,18 +910,24 @@ namespace GhostWalk {
                     if (info.Protect & (PAGE_GUARD | PAGE_NOACCESS)) continue;
 
                     const auto size = static_cast<std::size_t>(info.RegionSize);
-                    if (size < kMinRegionBytes || size > 64ull * 1024 * 1024) continue;
+                    if (size < kMinRegionBytes || size > 256ull * 1024 * 1024) continue;
 
-                    f32Regions.push_back({
-                        reinterpret_cast<std::uintptr_t>(info.BaseAddress), size
-                    });
+                    const auto baseAddr =
+                        reinterpret_cast<std::uintptr_t>(info.BaseAddress);
                     f32Total += size;
+                    if (!known.count(baseAddr)) {
+                        f32Regions.push_back({ baseAddr, size });
+                        ++added;
+                    }
                 }
 
-                std::cout << "[*] F 通道可写区域: " << f32Regions.size() << " 个, 共 "
-                    << (f32Total / 1024 / 1024) << " MB (每帧 memcmp 差分, 仅扫变化区域)"
-                    << std::endl;
-            }
+                if (!refreshQuiet || added > 0)
+                    std::cout << "[*] F 通道区域: " << f32Regions.size() << " 个, 共 "
+                        << (f32Total / 1024 / 1024) << " MB (新增 " << added
+                        << ")" << std::endl;
+            };
+
+            refreshF32Regions();
 
             std::ofstream csv;
             if (!options.csvPath.empty()) {
@@ -996,7 +1010,10 @@ namespace GhostWalk {
             constexpr std::size_t kClusterRowCap = 60; // 簇行数上限 (超过=噪声带)
             constexpr std::size_t kFlushObs = 3;       // 轨迹确认帧数 (持久性门槛)
             constexpr double kTrackTimeout = 12.0;     // 缺席超时 (秒, 按 dt 累计)
-            constexpr double kGapFrameDt = 2.5;        // 停帧判定阈值 (秒)
+            // 停帧判定阈值: 正常帧耗时 = 全量读取 1.2GB + 差分 ≈ 4~5s,
+            // 阈值必须显著高于正常帧间隔 (原 2.5s 会把每帧都误判为停帧,
+            // 导致差分永不执行、F 通道恒为 0)。真正的停帧 (CE 挂起等) > 12s
+            constexpr double kGapFrameDt = 12.0;       // 停帧判定阈值 (秒)
             constexpr double kMatchRadius = 30.0;      // 匹配半径 (按 |vx|*时长 放大)
 
             while (true) {
@@ -1005,6 +1022,14 @@ namespace GhostWalk {
                 previousScan = scanStart;
 
                 const bool dTick = (tick % 3 == 1) || tick <= 2;
+
+                // 每 10 帧动态刷新 F 通道区域: 回合开始时引擎新分配的
+                // 实体内存区域会被自动纳入差分 (首个出现帧仅建快照)
+                if (tick % 10 == 9) {
+                    refreshQuiet = true;
+                    refreshF32Regions();
+                    refreshQuiet = false;
+                }
 
                 // 停帧判定: 真实帧间隔超阈值 (如读取阻塞 23s), 跨帧累计变化失真
                 const bool gapFrame = dt > kGapFrameDt;
