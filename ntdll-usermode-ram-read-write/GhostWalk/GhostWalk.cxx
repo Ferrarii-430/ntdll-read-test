@@ -147,6 +147,16 @@ namespace GhostWalk {
             return fn ? fn(handle) : static_cast<NTSTATUS>(-1);
         }
 
+        // Ctrl+C 优雅退出: 设置停止标志, 主循环检测后 flush 全部 pending
+        volatile bool g_gwStop = false;
+
+        BOOL WINAPI GwCtrlHandler(DWORD type) {
+            if (type == CTRL_C_EVENT || type == CTRL_BREAK_EVENT
+                || type == CTRL_CLOSE_EVENT)
+                g_gwStop = true;
+            return TRUE;  // 阻止默认立即终止, 给主循环 flush 的时间窗口
+        }
+
         // 紧凑 ASCII str: len@+16 (1..32), data@+48, NUL 结尾;
         // 严格标识符子集 (dict 键 / entries 自定位用)
         bool IsIdentifierStr(const std::uint8_t* data, const std::size_t size,
@@ -937,6 +947,19 @@ namespace GhostWalk {
                     "entity_index,y,group_rows,track_y_range,dt_s\n";
             }
 
+            // mover 结构上下文转储: 轨迹确认/生成时 ±256B 快照落盘
+            // (回合结束后实体内存被回收, 必须在存活期即时转储)
+            std::ofstream moverCtxDump, moverCtxIdx;
+            {
+                const auto ctxRoot = std::filesystem::path("yys_walklist_dump");
+                std::filesystem::create_directories(ctxRoot);
+                moverCtxDump.open(ctxRoot / "moverctx.bin",
+                    std::ios::app | std::ios::binary);
+                moverCtxIdx.open(ctxRoot / "moverctx_index.csv", std::ios::app);
+                if (moverCtxIdx && moverCtxIdx.tellp() <= 0)
+                    moverCtxIdx << "type,track_id,x_addr,hero_id,hero_name,time\n";
+            }
+
             // 行级 CSV 写出 (entity_index=0 表示未入轨: D 通道行或停帧帧)
             auto writeRow = [&csv](const MoverRow& row) {
                 if (!csv) return;
@@ -959,8 +982,10 @@ namespace GhostWalk {
                     << std::setprecision(2) << row.dtSec << '\n';
             };
 
-            std::cout << "[*] 开始逐帧追踪, Ctrl+C 退出. (vx<0 即 x 递减 = 屏幕上右->左)"
-                << std::endl << std::endl;
+            std::cout << "[*] 开始逐帧追踪, Ctrl+C 退出 (优雅 flush pending)."
+                << " (vx<0 即 x 递减 = 屏幕上右->左)" << std::endl << std::endl;
+
+            SetConsoleCtrlHandler(GwCtrlHandler, TRUE);
 
             std::unordered_map<std::uintptr_t, double> previous;
             std::unordered_map<std::uintptr_t, std::deque<std::pair<double, double>>> history;
@@ -1008,15 +1033,17 @@ namespace GhostWalk {
             // 位置跟踪参数
             constexpr double kClusterGap = 3.0;        // x 相邻行归簇间距
             constexpr std::size_t kClusterRowCap = 60; // 簇行数上限 (超过=噪声带)
-            constexpr std::size_t kFlushObs = 3;       // 轨迹确认帧数 (持久性门槛)
+            constexpr std::size_t kFlushObs = 2;       // 轨迹确认帧数 (dt 大时降低门槛, 避免 Ctrl+C 丢 pending)
             constexpr double kTrackTimeout = 12.0;     // 缺席超时 (秒, 按 dt 累计)
             // 停帧判定阈值: 正常帧耗时 = 全量读取 1.2GB + 差分 ≈ 4~5s,
             // 阈值必须显著高于正常帧间隔 (原 2.5s 会把每帧都误判为停帧,
             // 导致差分永不执行、F 通道恒为 0)。真正的停帧 (CE 挂起等) > 12s
-            constexpr double kGapFrameDt = 12.0;       // 停帧判定阈值 (秒)
+            constexpr double kGapFrameDt = 20.0;       // 停帧判定阈值 (秒, 实际帧耗时 6~16s 不能误判)
             constexpr double kMatchRadius = 30.0;      // 匹配半径 (按 |vx|*时长 放大)
 
             while (true) {
+                if (g_gwStop) break;
+
                 const auto scanStart = std::chrono::steady_clock::now();
                 const auto dt = std::chrono::duration<double>(scanStart - previousScan).count();
                 previousScan = scanStart;
@@ -1296,6 +1323,30 @@ namespace GhostWalk {
                                     ++flushedRows;
                                 }
 
+                                // 确认时刻结构上下文 (含归属 ID)
+                                if (moverCtxDump.is_open() && !tr.pending.empty()) {
+                                    const auto maddr = tr.pending.back().address;
+                                    std::vector<std::uint8_t> ctx(512);
+                                    const auto got = memory->ReadPartial(
+                                        maddr - 256, ctx.data(), 512);
+                                    if (got > 0) {
+                                        moverCtxDump.write(reinterpret_cast<
+                                            const char*>(&maddr), sizeof(maddr));
+                                        const std::uint32_t len = 512;
+                                        moverCtxDump.write(reinterpret_cast<
+                                            const char*>(&len), sizeof(len));
+                                        moverCtxDump.write(reinterpret_cast<
+                                            const char*>(ctx.data()), len);
+                                        moverCtxIdx << "confirm," << tr.id << ",0x"
+                                            << std::hex << maddr << std::dec << ','
+                                            << (tr.hasHero ? std::to_string(tr.heroId)
+                                                : "") << ','
+                                            << (tr.hasHero ? tr.heroName : "") << ','
+                                            << tr.lastTime << '\n';
+                                        moverCtxIdx.flush();
+                                    }
+                                }
+
                                 tr.pending.clear();
                                 tr.pending.shrink_to_fit();
                                 tr.flushed = true;
@@ -1352,6 +1403,27 @@ namespace GhostWalk {
 
                         tracks.push_back(std::move(tr));
                         attach(tracks.back(), clusters[ci]);
+
+                        // 生成时刻结构上下文 (ID 归属未定, 离线经 CSV entity_index join)
+                        if (moverCtxDump.is_open()) {
+                            const auto maddr = clusters[ci].rws.front()->address;
+                            std::vector<std::uint8_t> ctx(512);
+                            const auto got = memory->ReadPartial(maddr - 256,
+                                ctx.data(), 512);
+                            if (got > 0) {
+                                moverCtxDump.write(reinterpret_cast<const char*>(
+                                    &maddr), sizeof(maddr));
+                                const std::uint32_t len = 512;
+                                moverCtxDump.write(reinterpret_cast<const char*>(
+                                    &len), sizeof(len));
+                                moverCtxDump.write(reinterpret_cast<const char*>(
+                                    ctx.data()), len);
+                                moverCtxIdx << "spawn," << trackSeq << ",0x"
+                                    << std::hex << maddr << std::dec << ",,,"
+                                    << clusters[ci].rws.front()->time << '\n';
+                                moverCtxIdx.flush();
+                            }
+                        }
                     }
 
                     // 本帧新入场的轨迹: 扩容 trackUsed 并记为已观测 (1)。
@@ -1512,6 +1584,18 @@ namespace GhostWalk {
 
                 Sleep(static_cast<DWORD>(std::max<long long>(
                     50, options.intervalMs - static_cast<long long>(elapsed))));
+            }
+
+            // 优雅退出: 补写全部未确认轨迹的 pending 行 (Ctrl+C 不丢数据)
+            {
+                std::size_t flushedPending = 0;
+                for (const auto& tr : tracks) {
+                    if (tr.flushed) continue;
+                    for (const auto& r : tr.pending) { writeRow(r); ++flushedPending; }
+                }
+                if (flushedPending > 0)
+                    std::cout << "[*] 退出补写 " << flushedPending
+                        << " 行 pending 数据" << std::endl;
             }
         }
         catch (const std::exception& exception) {
